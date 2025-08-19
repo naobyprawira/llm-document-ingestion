@@ -1,83 +1,144 @@
 """
-Structured text chunking based on hierarchical headings.
+Structured text chunking for HR/Compliance documents.
 
-This module implements a parser that splits a block of text into
-sections using headings of the form ``<n>.<m>.<p> ...``. Only up to
-three levels of headings are recognised. Headings deeper than three
-levels (e.g. ``6.1.1.1``) are assigned to their closest ancestor
-heading (``6.1.1``). This ensures that nested subtopics remain within
-the context of their parent section.
+Goals:
+- Respect numbered headings like "6", "6.1", "6.1.1".
+- Cap depth at 3. Fold deeper like "6.1.1.1" into "6.1.1".
+- Never cut inside a paragraph. Split on blank lines only.
+- Produce chunks sized for embeddings using word-count limits.
+- Return simple tuples for easy wiring: (heading, content).
 
-When no headings are detected in a given text block, the entire block
-is returned as a single chunk.
-
-Each returned chunk is a tuple ``(heading, body)``, where ``heading``
-may be an empty string if no numbered heading was found, and ``body``
-is the associated text.
+Public API:
+- chunk_document(content: str, max_words: int = 900, min_words: int = 200)
+    -> list[tuple[str, str]]
+- chunk_by_heading(content: str) -> list[tuple[str, str]]
+- smart_chunk(content: str, max_words: int = 900, min_words: int = 200)
+    -> list[str]
 """
+
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
+# Matches "6", "6.1", "6.1.1" + title. Depth >3 is folded by trimming.
+_HEADING_RE = re.compile(r"^(?P<num>\d+(?:\.\d+){0,10})\s+(?P<title>.+)$")
 
-_HEADING_RE = re.compile(r"^(\d+(?:\.\d+){0,2})\s+(.+)")
+def _fold_heading_number(num: str) -> str:
+    parts = num.split(".")
+    return ".".join(parts[:3])  # keep at most 3 levels
 
+def _is_heading(line: str) -> tuple[bool, str, str]:
+    m = _HEADING_RE.match(line.strip())
+    if not m:
+        return False, "", ""
+    num = _fold_heading_number(m.group("num"))
+    title = m.group("title").strip()
+    return True, num, title
 
-def chunk_by_heading(text: str) -> List[Tuple[str, str]]:
+def _word_count(s: str) -> int:
+    return len(s.split())
+
+def _split_paragraphs(text: str) -> List[str]:
+    # Normalize Windows/Mac line endings and collapse >2 blank lines to 2.
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    # Split on blank lines. Keep paragraph integrity.
+    paras = [p.strip() for p in re.split(r"\n\s*\n", normalized)]
+    return [p for p in paras if p]
+
+def smart_chunk(
+    content: str,
+    max_words: int = 900,
+    min_words: int = 200,
+) -> List[str]:
     """
-    Split text into chunks based on numbered headings.
-
-    Parameters
-    ----------
-    text: str
-        Input text, potentially containing multiple sections with
-        headings. Lines should be separated by newline characters.
-
-    Returns
-    -------
-    List[Tuple[str, str]]
-        A list of (heading, body) pairs. The heading is the
-        hierarchical number (e.g. ``"6.1"``) and the body is the text
-        following the heading up to but not including the next heading.
-        If no headings are found, the list contains a single chunk
-        with an empty heading and the entire input text as the body.
+    Paragraph-aware chunking. Never cuts inside a paragraph.
+    Builds chunks by appending whole paragraphs until max_words is met.
+    Ensures last tiny tail merges into previous chunk if < min_words.
     """
-    lines = text.splitlines()
-    chunks: List[Tuple[str, List[str]]] = []
-    current_heading: str | None = None
-    current_body: List[str] = []
+    paras = _split_paragraphs(content)
+    if not paras:
+        return []
 
-    for line in lines:
-        m = _HEADING_RE.match(line.strip())
-        if m:
-            # Flush previous chunk
-            if current_heading is not None or current_body:
-                heading = current_heading or ""
-                chunks.append((heading, current_body))
-                current_body = []
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_wc = 0
 
-            number = m.group(1)
-            title = m.group(2)
-            # Normalise the heading to at most 3 levels
-            parts = number.split(".")
-            if len(parts) > 3:
-                number = ".".join(parts[:3])
-            # Combine the number and title into a single heading string
-            current_heading = number + " " + title
+    for p in paras:
+        wc = _word_count(p)
+        if cur_wc and cur_wc + wc > max_words:
+            # finalize current chunk
+            chunks.append("\n\n".join(cur).strip())
+            cur, cur_wc = [], 0
+        cur.append(p)
+        cur_wc += wc
+
+    if cur:
+        chunks.append("\n\n".join(cur).strip())
+
+    # Merge tiny tail
+    if len(chunks) >= 2 and _word_count(chunks[-1]) < min_words:
+        last = chunks.pop()
+        chunks[-1] = (chunks[-1] + "\n\n" + last).strip()
+
+    return [c for c in chunks if c]
+
+def chunk_by_heading(content: str) -> List[Tuple[str, str]]:
+    """
+    Split by numbered headings. Returns (heading, content) pairs.
+    Heading is "6.1.1 Title" or "" when no heading seen yet.
+    """
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    chunks: List[Tuple[str, str]] = []
+    current_heading = ""
+    buf: List[str] = []
+
+    def flush():
+        nonlocal buf, current_heading
+        body = "\n".join(buf).strip()
+        if body:
+            chunks.append((current_heading, body))
+        buf = []
+
+    for raw in lines:
+        line = raw.rstrip()
+        is_h, num, title = _is_heading(line)
+        if is_h:
+            flush()
+            current_heading = f"{num} {title}".strip()
         else:
-            current_body.append(line)
+            buf.append(line)
 
-    # Append last chunk
-    if current_heading is not None or current_body:
-        heading = current_heading or ""
-        chunks.append((heading, current_body))
+    flush()
+    # Remove leading empty chunk if file starts with heading and no preface.
+    return [(h, b) for (h, b) in chunks if b]
 
-    # Convert body lists to strings and strip leading/trailing whitespace
-    result: List[Tuple[str, str]] = []
-    for heading, body_lines in chunks:
-        body_text = "\n".join(body_lines).strip()
-        # If body_text is empty and heading has content, at least keep the heading
-        result.append((heading, body_text))
+def chunk_document(
+    content: str,
+    max_words: int = 900,
+    min_words: int = 200,
+) -> List[Tuple[str, str]]:
+    """
+    Full policy:
+    1) Try heading-based split.
+    2) For each heading body, apply paragraph smart_chunk if oversized.
+    3) If no headings at all, smart_chunk the whole document.
+    """
+    by_head = chunk_by_heading(content)
+    if not by_head:
+        return [("", c) for c in smart_chunk(content, max_words, min_words)]
 
-    return result
+    out: List[Tuple[str, str]] = []
+    for heading, body in by_head:
+        pieces = smart_chunk(body, max_words, min_words)
+        if not pieces:
+            continue
+        if len(pieces) == 1:
+            out.append((heading, pieces[0]))
+        else:
+            # Keep heading label for all sub-chunks
+            out.extend((heading, p) for p in pieces)
+
+    return out

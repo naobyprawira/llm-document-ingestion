@@ -153,7 +153,7 @@ def ingest_document(
                     "page": page_index + 1,
                     "title": title,
                     "confidence": confidence,
-                    "text": steps_text,
+                    "content": steps_text,
                     # chunk_id is omitted for flow_steps
                 }
                 point = qm.PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload)
@@ -199,7 +199,7 @@ def ingest_document(
                     "page": page_index + 1,
                     "chunk_id": chunk_id,
                     "heading": "",
-                    "text": chunk_text,
+                    "content": chunk_text,
                 }
                 point = qm.PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload)
                 points.append(point)
@@ -231,7 +231,7 @@ def ingest_document(
                     "page": page_index + 1,
                     "chunk_id": chunk_id,
                     "heading": heading,
-                    "text": body,
+                    "content": body,
                 }
                 point = qm.PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload)
                 points.append(point)
