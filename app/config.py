@@ -2,7 +2,7 @@
 Application configuration and constants.
 
 This module reads environment variables and exposes configuration values
-used throughout the ingestion pipeline. Defaults are chosen to make
+used throughout the ingestion pipeline.  Defaults are chosen to make
 development simple while allowing override via environment.
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ class QdrantSettings:
 
 @dataclass
 class AppConfig:
-    """Top-level application configuration."""
+    """Top‑level application configuration."""
 
     # Qdrant configuration
     qdrant: QdrantSettings
