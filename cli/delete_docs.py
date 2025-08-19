@@ -1,37 +1,32 @@
+"""Command line interface for deleting documents or pages from Qdrant.
+
+This script wraps the deletion helpers in :mod:`app.storage.qdrant_store` and
+provides both hard and soft delete options.  You can delete all points
+belonging to a document or restrict deletion to a particular page.
 """
-Command-line interface for deleting ingested documents or specific pages.
-
-This script wraps the deletion utilities in ``app.deletion``. It
-provides two mutually exclusive modes:
-
-1. Delete an entire document by its document ID.
-2. Delete a specific page of a document by supplying both the document
-   ID and the page number.
-
-Deletion is permanent and irreversible. Use with caution.
-"""
-from __future__ import annotations
 
 import click
 
 from app.config import load_config
-from app.qdrant_client import get_client
-from app.deletion import delete_document, delete_document_page
+from app.storage.qdrant_store import get_client, delete_document, delete_document_page
 
 
-@click.command()
-@click.option("--doc-id", type=str, required=True, help="Document identifier used during ingestion.")
-@click.option("--page", type=int, default=None, help="Page number to delete (1-based). If omitted, deletes the entire document.")
-def main(doc_id: str, page: int | None) -> None:
-    """Delete a document or a specific page from Qdrant."""
+@click.command(help="Delete a document or a page from Qdrant")
+@click.option("--doc-id", type=str, required=True, help="Identifier of the document to delete.")
+@click.option("--page", type=int, default=None, help="Page number to delete. If omitted, the entire document is deleted.")
+@click.option("--soft", is_flag=True, help="Perform a soft deletion by setting the effective_to field instead of hard deleting.")
+def main(doc_id: str, page: int, soft: bool) -> None:
+    """
+    Delete or soft delete a document or a single page.
+    """
     config = load_config()
     client = get_client(config)
     if page is not None:
-        delete_document_page(client, config, doc_id, page)
-        click.echo(f"Deleted page {page} of document {doc_id}")
+        delete_document_page(client, config, doc_id, page, soft=soft)
+        click.echo(f"Deleted page {page} of document {doc_id} (soft={soft})")
     else:
-        delete_document(client, config, doc_id)
-        click.echo(f"Deleted document {doc_id}")
+        delete_document(client, config, doc_id, soft=soft)
+        click.echo(f"Deleted document {doc_id} (soft={soft})")
 
 
 if __name__ == "__main__":
