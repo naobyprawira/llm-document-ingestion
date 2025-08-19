@@ -1,20 +1,22 @@
-# app/vision/flowchart_extractor.py
 """
-Flowchart detection and VLM extraction.
+Flowchart detection and VLM extraction (plain text mode).
 
-- Detects likely-flowchart pages using vector primitives from PyMuPDF.
-- When detected (or forced), renders the page to PNG and asks Gemini VLM
-  to return STRICT JSON with ordered steps.
+- Detect likely-flowchart pages via vector primitives.
+- Render page to PNG and ask Gemini to return ONLY a numbered list of steps:
+  1. ...
+  2. ...
+  3. ...
+- No JSON is parsed. We extract numbered lines with a regex and renumber.
 
 Public API:
 - detect_flowchart(doc, page_index) -> bool
-- extract_flowchart_steps(doc, page_index, config) -> dict | None
+- extract_flowchart_steps(doc, page_index, config, *, force=False) -> dict | None
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 import google.generativeai as genai  # pip install google-generativeai
 
@@ -23,12 +25,12 @@ from ..parsers.pdf_text import render_page_to_png
 
 log = logging.getLogger(__name__)
 
-# Single instruction kept short to reduce hallucinations.
-FLOWCHART_JSON_PROMPT = (
-    "You are given a PNG of a flowchart. Return STRICT JSON only:\n"
-    '{ "has_flowchart": true|false, "title": "string",'
-    '  "steps": [ {"n": 1, "text": "..."}, {"n": 2, "text": "..."} ] }\n'
-    'If no flowchart is present, return {"has_flowchart": false} only.'
+# Keep the instruction minimal to reduce extra prose.
+FLOWCHART_STEPS_PROMPT = (
+    "You will see a PNG of a process flowchart.\n"
+    "OUTPUT FORMAT STRICTLY:\n"
+    "1. <first step>\n2. <second step>\n3. <third step>\n"
+    "Rules: numbered list only, one step per line, no headings, no JSON, no code fences, no extra text."
 )
 
 # Heuristics for detection using vector shapes.
@@ -37,18 +39,13 @@ _DRAW_MIN_LINES = 6
 
 
 def _count_shapes(page) -> Tuple[int, int]:
-    """
-    Count rectangles and line segments using PyMuPDF drawing objects.
-    """
     rects = 0
     lines = 0
     try:
         for item in page.get_drawings():
-            # item contains 'rect', 'items' etc.
             if item.get("rect"):
                 rects += 1
             for it in item.get("items", ()):
-                # ('l', p1, p2) is a line segment
                 if it and it[0] == "l":
                     lines += 1
     except Exception as e:  # pragma: no cover
@@ -57,12 +54,22 @@ def _count_shapes(page) -> Tuple[int, int]:
 
 
 def detect_flowchart(doc, page_index: int) -> bool:
-    """
-    Lightweight detection: enough boxes and lines suggests a flowchart.
-    """
     page = doc.load_page(page_index)
     boxes, segs = _count_shapes(page)
     return boxes >= _DRAW_MIN_BOXES and segs >= _DRAW_MIN_LINES
+
+
+_NUM_LINE_RE = re.compile(r"^\s*(\d+)[\.\)\-]\s+(.*\S)\s*$")
+
+
+def _extract_numbered_lines(raw: str) -> List[str]:
+    """Extract '1. ...' lines and return the step texts."""
+    lines = []
+    for line in raw.splitlines():
+        m = _NUM_LINE_RE.match(line)
+        if m:
+            lines.append(m.group(2).strip())
+    return lines
 
 
 def extract_flowchart_steps(
@@ -74,55 +81,45 @@ def extract_flowchart_steps(
     timeout_s: int = 60,
 ) -> Optional[Dict[str, Any]]:
     """
-    If page looks like a flowchart (or force=True), call Gemini VLM and
-    return a dict:
-      {
-        "has_flowchart": bool,
-        "title": str,
-        "steps_text": "1. ...\\n2. ...",
-      }
-    Returns None on transport/parse errors.
+    Returns:
+      {"has_flowchart": False} when not detected or no valid steps.
+      {"has_flowchart": True, "title": "", "steps_text": "1. ...\\n2. ..."} on success.
     """
     if not force and not detect_flowchart(doc, page_index):
         return {"has_flowchart": False}
 
-    # Render once to bytes
     image_bytes = render_page_to_png(doc, page_index, dpi=config.image_dpi)
 
-    # Configure and call VLM
     genai.configure(api_key=config.google_api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # Plain text output; temperature 0 to reduce fluff.
+    model = genai.GenerativeModel("gemini-1.5-flash", generation_config={"temperature": 0.0})
 
     try:
         resp = model.generate_content(
             [
                 {"mime_type": "image/png", "data": image_bytes},
-                FLOWCHART_JSON_PROMPT,
+                FLOWCHART_STEPS_PROMPT,
             ],
             request_options={"timeout": timeout_s},
         )
-        text = (resp.text or "").strip()
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        log.warning("VLM returned non-JSON on page %d", page_index + 1)
-        return None
+        raw = (resp.text or "").strip()
     except Exception as e:
-        log.warning("Gemini VLM call failed: %s", e)
+        log.warning("Gemini VLM call failed on page %d: %s", page_index + 1, e)
         return None
 
-    if not isinstance(data, dict) or not data.get("has_flowchart"):
+    steps = _extract_numbered_lines(raw)
+
+    # Require at least 2 steps to consider it a flowchart
+    if len(steps) < 2:
+        log.debug("No numbered steps extracted on page %d. Raw preview: %.120s", page_index + 1, raw.replace("\n", " "))
         return {"has_flowchart": False}
 
-    steps = data.get("steps") or []
-    steps_text = "\n".join(
-        f"{int(s.get('n', i+1))}. {str(s.get('text','')).strip()}"
-        for i, s in enumerate(steps)
-        if isinstance(s, dict)
-    )
+    # Renumber cleanly to avoid '1., 3., 4.' artifacts
+    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps[:50]))
 
     return {
         "has_flowchart": True,
-        "title": str(data.get("title") or "").strip(),
+        "title": "",            # keep field for payload schema compatibility
         "steps_text": steps_text,
     }
 
