@@ -1,4 +1,4 @@
-"""Command line interface for ingesting PDF documents.
+r"""Command line interface for ingesting PDF documents.
 
 Wraps :func:`app.pipelines.ingest_pdf.ingest_document`.
 
