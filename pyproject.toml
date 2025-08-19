@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-document-ingestion"
+version = "0.1.0"
+description = "PDF ingestion pipeline with flowchart detection, chunking, embeddings and Qdrant storage"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["app", "cli"]
