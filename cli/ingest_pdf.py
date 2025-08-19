@@ -1,60 +1,57 @@
 """Command line interface for ingesting PDF documents.
 
-This script provides a convenient wrapper around :func:`app.pipelines.ingest_pdf.ingest_document`
-allowing users to ingest a PDF into Qdrant from the command line.  It supports
-resuming from a given page, limiting the number of pages to ingest, and
-performing a dry run where no data is written to the database.
-"""
+Wraps :func:`app.pipelines.ingest_pdf.ingest_document`.
 
-import uuid
+Examples (Windows CMD):
+  python -m cli.ingest_pdf ^
+    --path "D:\docs\policy.pdf" ^
+    --scope GovReg --company PRB --country ID ^
+    --doc-id TEST-001 ^
+    --dry-run --start-page 1 --max-pages 2 --force-vlm
+"""
+from __future__ import annotations
+
 import click
 
 from app.config import load_config
 from app.pipelines.ingest_pdf import ingest_document
 
 
-@click.command(help="Ingest a PDF document into Qdrant")
-@click.option("--path", "path_", type=click.Path(exists=True), required=True, help="Path to the PDF file to ingest.")
-@click.option("--doc-id", type=str, default=None, help="Identifier for the document; if omitted a UUID will be generated.")
-@click.option("--scope", type=str, required=True, help="Top‑level scope of the document, e.g. GovReg, AdidasCompliance, Internal.")
-@click.option("--company", type=str, required=True, help="Company identifier (e.g. PRB, PBB, GROUP). Ignored for non‑internal scopes.")
-@click.option("--country", type=str, required=True, help="Country code (e.g. ID or GLOBAL).")
-@click.option("--language", type=str, default=None, help="Language code of the document. Defaults to configuration default.")
-@click.option("--version", type=str, default="v1", help="Version identifier of the document.")
-@click.option("--effective-from", type=str, default="1970-01-01", help="ISO date from which the document is effective.")
-@click.option("--effective-to", type=str, default=None, help="ISO date until which the document is effective. None means indefinite.")
-@click.option("--security-class", type=str, default="internal", help="Security classification, e.g. internal, confidential.")
-@click.option("--start-page", type=int, default=1, help="1‑indexed page number from which to start ingestion.")
-@click.option("--max-pages", type=int, default=None, help="Maximum number of pages to ingest.")
-@click.option("--dry-run", is_flag=True, help="When set, perform a dry run without writing to Qdrant.")
+@click.command(context_settings=dict(help_option_names=["-h", "--help"]))
+@click.option("--path", required=True, type=click.Path(exists=True, dir_okay=False), help="Input PDF file.")
+@click.option("--doc-id", required=True, help="Stable document identifier.")
+@click.option("--scope", required=True, help="Business scope or category.")
+@click.option("--company", required=True, help="Company code.")
+@click.option("--country", required=True, help="Country code, e.g., ID.")
+@click.option("--language", default=None, help="BCP-47 language tag, e.g., id.")
+@click.option("--version", default="v1", show_default=True, help="Document version string.")
+@click.option("--effective-from", default="1970-01-01", show_default=True, help="ISO date when the doc becomes effective.")
+@click.option("--effective-to", default=None, help="Optional ISO date when the doc expires.")
+@click.option("--security-class", default="internal", show_default=True, help="Security classification label.")
+@click.option("--start-page", "--resume-from", type=int, default=1, show_default=True, help="First page to process (1-based).")
+@click.option("--max-pages", type=int, default=0, show_default=True, help="Max pages to process starting from --start-page. 0 = all.")
+@click.option("--dry-run", is_flag=True, help="Parse and chunk only. Do not write to Qdrant.")
+@click.option("--force-vlm", is_flag=True, help="Force VLM flowchart extraction on processed pages.")
 def main(
-    path_: str,
+    path: str,
     doc_id: str,
     scope: str,
     company: str,
     country: str,
-    language: str,
+    language: str | None,
     version: str,
     effective_from: str,
-    effective_to: str,
+    effective_to: str | None,
     security_class: str,
     start_page: int,
     max_pages: int,
     dry_run: bool,
+    force_vlm: bool,
 ) -> None:
-    """
-    Ingest a PDF file into a Qdrant collection using the configured pipeline.
+    cfg = load_config()
 
-    Parameters are provided via command line options.  See ``--help`` for
-    details on each option.
-    """
-    config = load_config()
-    # Generate a document ID if not provided
-    if not doc_id:
-        doc_id = str(uuid.uuid4())
-    # Call the ingestion function
     result = ingest_document(
-        filepath=path_,
+        filepath=path,
         doc_id=doc_id,
         scope=scope,
         company=company,
@@ -67,9 +64,15 @@ def main(
         start_page=start_page,
         max_pages=max_pages,
         dry_run=dry_run,
-        config=config,
+        force_vlm=force_vlm,
+        config=cfg,
     )
-    click.echo(f"Ingested document {doc_id} with {len(result['flowcharts'])} flowchart(s) and {len(result['text_chunks'])} text chunk(s)")
+
+    print(
+        f"Ingested document {doc_id} with "
+        f"{result.get('n_flowcharts', 0)} flowchart(s) and "
+        f"{result.get('n_text_chunks', 0)} text chunk(s)"
+    )
 
 
 if __name__ == "__main__":
