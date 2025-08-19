@@ -5,13 +5,13 @@ This module wraps common Qdrant operations such as ensuring the collection
 exists, upserting points with payloads, and deleting points via filters.
 
 The functions defined here rely on the configuration defined in
-``app.config``.  They abstract away the low‑level details of connecting
+``app.config``. They abstract away the low-level details of connecting
 to Qdrant and managing payload indices.
 """
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Sequence
+from typing import List, Optional, Sequence, Union
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
@@ -29,17 +29,8 @@ def get_client(config: AppConfig) -> QdrantClient:
 def ensure_collection(client: QdrantClient, config: AppConfig, vector_dim: int) -> None:
     """
     Ensure that the configured collection exists and has appropriate payload
-    indexes.  If the collection does not exist, it is created with the
+    indexes. If the collection does not exist, it is created with the
     specified vector dimension.
-
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration, provides the collection name.
-    vector_dim: int
-        The dimension of the vectors that will be stored in the collection.
     """
     collection = config.qdrant.collection
     existing = client.get_collections().collections
@@ -72,46 +63,52 @@ def ensure_collection(client: QdrantClient, config: AppConfig, vector_dim: int) 
                     field_name=field_name,
                     field_schema=schema_type,
                 )
-            except Exception as e:  # pragma: no cover - index creation should succeed
+            except Exception as e:  # pragma: no cover
                 logger.warning("Failed to create index for field '%s': %s", field_name, e)
 
 
 def upsert_points(
     client: QdrantClient,
     config: AppConfig,
-    points: Sequence[qm.PointStruct],
+    payloads_or_points: Union[Sequence[qm.PointStruct], Sequence[dict]],
+    vectors: Optional[Sequence[Sequence[float]]] = None,
+    point_ids: Optional[Sequence[int]] = None,
 ) -> None:
     """
-    Upsert a batch of points into the configured collection.
+    Upsert vectors into Qdrant.
 
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration providing the collection name.
-    points: Sequence[qm.PointStruct]
-        A sequence of points to upsert.
+    Two call modes are supported:
+      1) upsert_points(client, config, [PointStruct, ...])
+      2) upsert_points(client, config, [payload, ...], [vector, ...], point_ids=[...])
+
+    When explicit IDs are provided, they are attached to the corresponding points.
     """
-    if not points:
+    if not payloads_or_points:
         return
-    client.upsert(collection_name=config.qdrant.collection, points=points)
+
+    # Mode 1: user already built PointStructs
+    if vectors is None and isinstance(payloads_or_points[0], qm.PointStruct):  # type: ignore[index]
+        points = list(payloads_or_points)  # type: ignore[assignment]
+    else:
+        # Mode 2: build PointStructs from payloads + vectors (+ optional ids)
+        payloads = list(payloads_or_points)  # type: ignore[assignment]
+        if vectors is None:
+            raise ValueError("vectors must be provided when passing payload dictionaries")
+        if len(payloads) != len(vectors):
+            raise ValueError("payloads and vectors must have the same length")
+        if point_ids is not None and len(point_ids) != len(payloads):
+            raise ValueError("point_ids length must match payloads length when provided")
+
+        points: List[qm.PointStruct] = []
+        for i, (pl, vec) in enumerate(zip(payloads, vectors)):
+            pid = None if point_ids is None else int(point_ids[i])
+            points.append(qm.PointStruct(id=pid, vector=[float(x) for x in vec], payload=pl))
+
+    client.upsert(collection_name=config.qdrant.collection, points=points, wait=True)
 
 
 def delete_by_filter(client: QdrantClient, config: AppConfig, flt: qm.Filter) -> None:
-    """
-    Permanently delete all points matching the given filter in the configured
-    collection.
-
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration providing the collection name.
-    flt: qm.Filter
-        The filter specifying which points to delete.
-    """
+    """Permanently delete all points matching the given filter."""
     client.delete(collection_name=config.qdrant.collection, points_selector=qm.FilterSelector(filter=flt))
 
 
@@ -122,25 +119,10 @@ def soft_delete_by_filter(
     effective_to: Optional[str] = None,
 ) -> None:
     """
-    Soft delete all points matching the given filter by updating their
-    ``effective_to`` payload field.  This preserves the points but marks
-    them as inactive for retrieval.
-
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration providing the collection name.
-    flt: qm.Filter
-        The filter specifying which points to update.
-    effective_to: Optional[str]
-        ISO timestamp to set for the ``effective_to`` field.  If omitted,
-        the current UTC timestamp will be used.
+    Soft delete all points matching the filter by updating their ``effective_to`` payload.
     """
     from datetime import datetime, timezone
 
-    # Default to current time if not provided
     eff_to = effective_to or datetime.now(timezone.utc).isoformat()
     try:
         client.update_payload(
@@ -148,26 +130,12 @@ def soft_delete_by_filter(
             points_selector=qm.FilterSelector(filter=flt),
             payload={"effective_to": eff_to},
         )
-    except Exception as e:  # pragma: no cover - should succeed
+    except Exception as e:  # pragma: no cover
         logger.error("Soft delete failed: %s", e)
 
 
 def delete_document(client: QdrantClient, config: AppConfig, doc_id: str, *, soft: bool = False) -> None:
-    """
-    Delete or soft delete all points belonging to a document.
-
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration providing the collection name.
-    doc_id: str
-        Identifier of the document to delete.
-    soft: bool, optional
-        When True, perform a soft deletion by setting the ``effective_to``
-        payload; otherwise, remove the points permanently.
-    """
+    """Delete or soft delete all points for a document."""
     flt = build_doc_filter(doc_id)
     if soft:
         soft_delete_by_filter(client, config, flt)
@@ -178,22 +146,7 @@ def delete_document(client: QdrantClient, config: AppConfig, doc_id: str, *, sof
 def delete_document_page(
     client: QdrantClient, config: AppConfig, doc_id: str, page: int, *, soft: bool = False
 ) -> None:
-    """
-    Delete or soft delete all points belonging to a specific page of a document.
-
-    Parameters
-    ----------
-    client: QdrantClient
-        The Qdrant client.
-    config: AppConfig
-        Application configuration providing the collection name.
-    doc_id: str
-        Identifier of the document.
-    page: int
-        Page number (1‑indexed) of the document to delete.
-    soft: bool, optional
-        When True, perform a soft deletion; otherwise, remove permanently.
-    """
+    """Delete or soft delete all points for a specific page of a document."""
     flt = build_doc_page_filter(doc_id, page)
     if soft:
         soft_delete_by_filter(client, config, flt)
@@ -202,16 +155,12 @@ def delete_document_page(
 
 
 def build_doc_filter(doc_id: str) -> qm.Filter:
-    """Build a Qdrant filter matching all points belonging to a document."""
-    return qm.Filter(
-        must=[
-            qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)),
-        ]
-    )
+    """Filter matching all points belonging to a document."""
+    return qm.Filter(must=[qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id))])
 
 
 def build_doc_page_filter(doc_id: str, page: int) -> qm.Filter:
-    """Build a Qdrant filter matching all points for a specific document page."""
+    """Filter matching all points for a specific document page."""
     return qm.Filter(
         must=[
             qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)),
