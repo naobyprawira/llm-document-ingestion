@@ -76,8 +76,12 @@ def ingest_document(
     embedder = EmbeddingModel(conf)
     client = None
     if not dry_run:
+        # Determine embedding vector dimension once
+        probe_vec = embedder.embed_text("dim probe")
+        vector_dim = len(probe_vec)
+
         client = get_client(conf)
-        ensure_collection(client, conf)
+        ensure_collection(client, conf, vector_dim)
 
     n_flowcharts = 0
     n_text_chunks = 0
