@@ -1,6 +1,6 @@
 click
 python-dotenv
-fitz
+pymupdf
 google-generativeai
 qdrant-client
 PyPDF2
