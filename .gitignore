@@ -1,0 +1,6 @@
+.venv
+.env
+temp
+src/__pycache__
+*.pyc
+*.code-workspace
