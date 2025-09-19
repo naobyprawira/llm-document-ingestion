@@ -23,6 +23,7 @@ from typing import Optional, List, Dict, Any, Type
 try:
     from google import genai  # type: ignore
     from google.genai import types  # type: ignore
+    from google.genai import errors as genai_errors  # typed errors with HTTP codes
     _HAS_GOOGLE = True
 except Exception:
     # When the Google Generative AI SDK is unavailable, stub out the imports
@@ -56,11 +57,26 @@ class VLMConfig:
     candidate_count: int = int(os.getenv("VLM_CANDIDATE_COUNT", "1"))
     stop_sequences: List[str] = field(
         default_factory=lambda: (
-            os.getenv("VLM_STOP", "").split("|") if os.getenv("VLM_STOP") else []
+            os.getenv("VLM_STOP", "").split(
+                "|") if os.getenv("VLM_STOP") else []
         )
     )
     retry_max: int = int(os.getenv("RETRY_MAX", "3"))
     retry_base: float = float(os.getenv("RETRY_BASE_SEC", "0.8"))
+
+
+def _is_transient_error(e: Exception) -> bool:
+    # Retry only on well-known transient conditions
+    if genai_errors and isinstance(e, genai_errors.APIError):
+        return getattr(e, "code", None) in (429, 500, 502, 503, 504)
+    # Network blips and timeouts can be transient too:
+    return isinstance(e, (TimeoutError, OSError))
+
+
+def _backoff_seconds(base: float, attempt: int, cap: float = 30.0) -> float:
+    # Truncated exponential backoff with jitter (Google’s guidance for 429/5xx)
+    # delay = min(cap, base * 2^attempt) * uniform(0.5, 1.5)
+    return min(cap, base * (2 ** attempt)) * random.uniform(0.5, 1.5)
 
 
 # System rules and task template used to frame prompts to the model
@@ -130,7 +146,8 @@ class GeminiVLM:
         )
         if response_mime_type:
             try:
-                gen_cfg.response_mime_type = response_mime_type  # type: ignore[attr-defined]
+                # type: ignore[attr-defined]
+                gen_cfg.response_mime_type = response_mime_type
             except Exception:
                 pass
 
@@ -138,8 +155,10 @@ class GeminiVLM:
             text = (getattr(resp, "text", "") or "").strip()
             fr = None
             try:
-                cand0 = resp.candidates[0] if getattr(resp, "candidates", None) else None
-                fr = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
+                cand0 = resp.candidates[0] if getattr(
+                    resp, "candidates", None) else None
+                fr = getattr(cand0, "finish_reason", None) or getattr(
+                    cand0, "finishReason", None)
             except Exception:
                 pass
             return text, fr
@@ -160,7 +179,8 @@ class GeminiVLM:
                     if getattr(ev, "candidates", None):
                         try:
                             cand0 = ev.candidates[0]
-                            fr = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
+                            fr = getattr(cand0, "finish_reason", None) or getattr(
+                                cand0, "finishReason", None)
                             if fr:
                                 finish_reason = fr
                         except Exception:
@@ -220,15 +240,19 @@ class GeminiVLM:
             tail = out[-300:] if len(out) > 300 else out
             parts = make_parts_for_continue(tail)
             mime = "application/json" if want_json else None
-            more, fr = self._gen_once(parts, response_mime_type=mime, stream=True)
+            more, fr = self._gen_once(
+                parts, response_mime_type=mime, stream=True)
             # Guard against repetition at the concat boundary
             if more and tail and more.startswith(tail[-50:]):
                 more = more[len(tail[-50:]):].lstrip()
-            out += ("\n" if out and more and not want_json else "") + (more or "")
+            out += ("\n" if out and more and not want_json else "") + \
+                (more or "")
             if want_json:
-                need_more = (fr == "MAX_TOKENS") or self._looks_incomplete_json(out)
+                need_more = (
+                    fr == "MAX_TOKENS") or self._looks_incomplete_json(out)
             else:
-                need_more = (fr == "MAX_TOKENS") or self._looks_incomplete_text(out)
+                need_more = (
+                    fr == "MAX_TOKENS") or self._looks_incomplete_text(out)
         return out
 
     # Public: plain text describe
@@ -245,17 +269,22 @@ class GeminiVLM:
             task=prompt, lang=lang, fmt="Plain text", max_words=max_words
         )
         last_exc: Optional[Exception] = None
+        last_exc: Optional[Exception] = None
+
+
         for attempt in range(self.cfg.retry_max):
             try:
                 parts = [
                     types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                     instruction,
                 ]
-                text, finish = self._gen_once(parts, response_mime_type=None, stream=True)
+                text, finish = self._gen_once(
+                    parts, response_mime_type=None, stream=True)
 
                 def make_parts_for_continue(tail: str) -> List[Any]:
                     return [
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        types.Part.from_bytes(
+                            data=image_bytes, mime_type="image/jpeg"),
                         (
                             f"{instruction}\n\n"
                             "Continue EXACTLY from where you stopped. Do not repeat earlier text. "
@@ -267,91 +296,106 @@ class GeminiVLM:
                     text, finish, make_parts_for_continue, want_json=False, max_continues=4
                 )
                 return full.strip()
+
             except Exception as e:
                 last_exc = e
-                time.sleep(self.cfg.retry_base * (2 ** attempt))
+                if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
+                    time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
+                    continue
+                break
         return f"[VLM-ERROR] {last_exc}"
 
-    # Public: structured JSON describe
-    def describe_json(
-        self,
-        image_bytes: bytes,
-        prompt: str,
-        *,
-        schema_model: Optional[Type[Any]] = None,
-        lang: str = "English",
-        examples: Optional[List[Dict[str, Any]]] = None,
-        strict_json: bool = True,
-        max_words_hint: int = 200,
-    ) -> Dict[str, Any]:
-        """Ask for JSON output; validate & auto‑repair. Auto‑continues when truncated."""
-        want_schema = (schema_model is not None) and HAS_PYDANTIC
-        json_rule = (
-            "Return ONLY valid JSON. Do not include backticks, code fences, or extra text."
-            if strict_json
-            else "Return JSON first; any comments after the JSON will be ignored."
-        )
-        example_block = ""
-        if examples:
-            try:
-                example_block = "\nEXAMPLE JSON:\n" + json.dumps(examples[0], ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        base_instruction = (
-            _SYSTEM_RULES
-            + "\n"
-            + _TASK_TEMPLATE.format(task=prompt, lang=lang, fmt="JSON", max_words=max_words_hint)
-            + f"\n{json_rule}"
-            + example_block
-        )
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.cfg.retry_max):
-            try:
-                parts = [
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    base_instruction,
-                ]
-                txt, finish = self._gen_once(parts, response_mime_type="application/json", stream=True)
+# Public: structured JSON describe
 
-                def make_parts_for_continue(tail: str) -> List[Any]:
-                    return [
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        (
-                            base_instruction
-                            + "\nContinue the SAME JSON object EXACTLY from where you stopped "
-                              "(do not repeat earlier keys/values). "
-                              "Append only the missing part so that the final result is valid JSON.\n"
-                              "Tail context:\n<<<\n"
-                            + tail
-                            + "\n>>>"
-                        ),
-                    ]
-                txt = self._continue_until_done(
-                    txt, finish, make_parts_for_continue, want_json=True, max_continues=5
-                )
-                cleaned = txt.strip()
-                if strict_json and cleaned.startswith("```"):
-                    first_nl = cleaned.find("\n")
-                    if first_nl != -1:
-                        cleaned = cleaned[first_nl + 1 :]
-                if strict_json and cleaned.endswith("```"):
-                    cleaned = cleaned[:-3]
-                cleaned = cleaned.strip()
-                data = json.loads(cleaned)
-                if want_schema:
-                    try:
-                        validated = schema_model.model_validate(data)  # type: ignore[attr-defined]
-                        return json.loads(validated.model_dump_json())  # type: ignore[attr-defined]
-                    except AttributeError:
-                        validated = schema_model.parse_obj(data)  # type: ignore[attr-defined]
-                        return validated.dict()  # type: ignore[attr-defined]
-                return data
-            except Exception as e:
-                last_exc = e
+
+def describe_json(
+    self,
+    image_bytes: bytes,
+    prompt: str,
+    *,
+    schema_model: Optional[Type[Any]] = None,
+    lang: str = "English",
+    examples: Optional[List[Dict[str, Any]]] = None,
+    strict_json: bool = True,
+    max_words_hint: int = 200,
+) -> Dict[str, Any]:
+    """Ask for JSON output; validate & auto‑repair. Auto‑continues when truncated."""
+    want_schema = (schema_model is not None) and HAS_PYDANTIC
+    json_rule = (
+        "Return ONLY valid JSON. Do not include backticks, code fences, or extra text."
+        if strict_json
+        else "Return JSON first; any comments after the JSON will be ignored."
+        )
+    example_block = ""
+    if examples:
+        try:
+            example_block = "\nEXAMPLE JSON:\n" + \
+                json.dumps(examples[0], ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    base_instruction = (
+        _SYSTEM_RULES
+        + "\n"
+        + _TASK_TEMPLATE.format(task=prompt, lang=lang,
+                                fmt="JSON", max_words=max_words_hint)
+        + f"\n{json_rule}"
+        + example_block
+    )
+    last_exc: Optional[Exception] = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(self.cfg.retry_max):
+        try:
+            parts = [
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                base_instruction,
+            ]
+            txt, finish = self._gen_once(parts, response_mime_type="application/json", stream=True)
+
+            def make_parts_for_continue(tail: str) -> List[Any]:
+                return [
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    (
+                        base_instruction
+                        + "\nContinue the SAME JSON object EXACTLY from where you stopped "
+                        "(do not repeat earlier keys/values). "
+                        "Append only the missing part so that the final result is valid JSON.\n"
+                        "Tail context:\n<<<\n" + tail + "\n>>>"
+                    ),
+                ]
+
+            txt = self._continue_until_done(
+                txt, finish, make_parts_for_continue, want_json=True, max_continues=5
+            )
+
+            cleaned = txt.strip()
+            if strict_json and cleaned.startswith("```"):
+                first_nl = cleaned.find("\n")
+                if first_nl != -1:
+                    cleaned = cleaned[first_nl + 1 :]
+            if strict_json and cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+
+            data = json.loads(cleaned)
+            if want_schema:
+                try:
+                    validated = schema_model.model_validate(data)  # type: ignore[attr-defined]
+                    return json.loads(validated.model_dump_json())  # type: ignore[attr-defined]
+                except AttributeError:
+                    validated = schema_model.parse_obj(data)  # type: ignore[attr-defined]
+                    return validated.dict()  # type: ignore[attr-defined]
+            return data
+
+        except Exception as e:
+            last_exc = e
+            # Enrich the instruction only if we'll retry
+            if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
                 base_instruction += f"\nVALIDATION ERROR:\n{e}\nFix and output ONLY valid JSON."
-                time.sleep(self.cfg.retry_base * (2 ** attempt))
-        # Last resort: surface raw error
-        return {"_raw": "", "_error": str(last_exc) if last_exc else "unknown"}
+                time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
+                continue
+            break
+
+    return {"_raw": "", "_error": str(last_exc) if last_exc else "unknown"}
 
 
 if __name__ == "__main__":  # pragma: no cover
