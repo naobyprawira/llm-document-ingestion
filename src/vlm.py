@@ -5,11 +5,13 @@ Visual language model wrapper using Google’s Gemini API.
 This module provides a ``GeminiVLM`` class that wraps the Google
 Generative AI SDK (``google.genai``) to describe images using a
 language model. It includes retry logic, streaming support and
-auto‑continuation to handle truncated responses. Configuration is
+auto-continuation to handle truncated responses. Configuration is
 controlled via the ``VLMConfig`` dataclass, which reads defaults
 from environment variables. The implementation below matches the
-upstream code from the reference repository with minor reformatting
-for readability.
+upstream code with small improvements:
+- Retries trigger only on transient failures (429/500/502/503/504, timeouts).
+- Optional client timeout via HttpOptions (VLMConfig.timeout_ms).
+- AFC config is NOT set (no explicit disable/enable).
 """
 
 from __future__ import annotations
@@ -17,11 +19,26 @@ from __future__ import annotations
 import os
 import time
 import json
+import random
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Type
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai  # type: ignore
+    from google.genai import types  # type: ignore
+    try:
+        # Typed error classes (present in google-genai)
+        from google.genai import errors as genai_errors  # type: ignore
+    except Exception:
+        genai_errors = None  # type: ignore
+    _HAS_GOOGLE = True
+except Exception:
+    # When the Google Generative AI SDK is unavailable, stub out the imports
+    genai = None  # type: ignore
+    types = None  # type: ignore
+    genai_errors = None  # type: ignore
+    _HAS_GOOGLE = False
+
 from .prompts import default_prompt
 
 # Optional import of Pydantic for structured JSON validation
@@ -34,12 +51,7 @@ except Exception:
 
 @dataclass
 class VLMConfig:
-    """Configuration for ``GeminiVLM``.
-
-    All values can be overridden via environment variables. See the
-    ``vlm.py`` in the upstream repository for further discussion of
-    these parameters.
-    """
+    """Configuration for ``GeminiVLM``. All values can be overridden via env vars."""
     api_key: str = os.getenv("GOOGLE_API_KEY", "")
     model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     max_tokens: int = int(os.getenv("VLM_MAX_TOKENS", "1512"))
@@ -52,8 +64,11 @@ class VLMConfig:
             os.getenv("VLM_STOP", "").split("|") if os.getenv("VLM_STOP") else []
         )
     )
-    retry_max: int = int(os.getenv("RETRY_MAX", "3"))
+    # Retry/backoff
+    retry_max: int = int(os.getenv("RETRY_MAX", "5"))
     retry_base: float = float(os.getenv("RETRY_BASE_SEC", "0.8"))
+    # Optional HTTP timeout for the SDK client (milliseconds)
+    timeout_ms: Optional[int] = int(os.getenv("GENAI_TIMEOUT_MS", "0")) or None
 
 
 # System rules and task template used to frame prompts to the model
@@ -61,7 +76,7 @@ _SYSTEM_RULES = """\
 You are an image description assistant.
 Follow these rules:
 - Be concise and factual. If unsure, say you are unsure.
-- Do not include hidden reasoning or chain‑of‑thought.
+- Do not include hidden reasoning or chain-of-thought.
 - Do not invent text in the image. If text is unreadable, say it.
 - Respect the requested output format exactly.
 """
@@ -78,23 +93,47 @@ If you are uncertain, set fields to null or empty rather than guessing.
 """
 
 
+def _is_transient_error(e: Exception) -> bool:
+    """Return True if exception is transient (safe to retry)."""
+    if genai_errors and isinstance(e, genai_errors.APIError):
+        code = getattr(e, "code", None)
+        if code in (429, 500, 502, 503, 504):
+            return True
+    # Network-level hiccups/timeouts
+    if isinstance(e, (TimeoutError, OSError)):
+        return True
+    return False
+
+
+def _backoff_seconds(base: float, attempt: int, cap: float = 30.0) -> float:
+    """Truncated exponential backoff with jitter."""
+    return min(cap, base * (2 ** attempt)) * random.uniform(0.5, 1.5)
+
+
 class GeminiVLM:
     """Client for the Google Generative AI vision model.
 
-    It exposes ``describe`` to return a plain‑text description and
-    ``describe_json`` to return structured JSON. Internally it
-    automatically retries truncated outputs by continuing from the
-    previous tail. A streaming API is used when available but falls
-    back to a one‑shot call if streaming is unsupported.
+    When the Google SDK is unavailable, the class falls back to a dummy
+    implementation that returns generic descriptions instead of
+    querying an external service.
     """
 
-    def __init__(self, cfg: Optional[VLMConfig] = None):
+    def __init__(self, cfg: Optional[VLMConfig] = None) -> None:
         self.cfg = cfg or VLMConfig()
-        if not self.cfg.api_key:
-            raise ValueError("GOOGLE_API_KEY is missing")
-        self.client = genai.Client(api_key=self.cfg.api_key)
+        if _HAS_GOOGLE:
+            if not self.cfg.api_key:
+                raise ValueError("GOOGLE_API_KEY is missing")
+            # Optional client-level timeout via HttpOptions
+            if self.cfg.timeout_ms:
+                http_opts = types.HttpOptions(timeout=self.cfg.timeout_ms)
+                self.client = genai.Client(api_key=self.cfg.api_key, http_options=http_opts)
+            else:
+                self.client = genai.Client(api_key=self.cfg.api_key)
+        else:
+            # Dummy client placeholder
+            self.client = None  # type: ignore
 
-    # Low‑level one‑shot generation (with optional streaming)
+    # Low-level one-shot generation (with optional streaming)
     def _gen_once(
         self,
         parts: list,
@@ -102,7 +141,15 @@ class GeminiVLM:
         response_mime_type: str | None = None,
         stream: bool = True,
     ) -> tuple[str, Optional[str]]:
-        """Perform a single generation call, returning text and finish_reason."""
+        """Perform a single generation call, returning text and finish_reason.
+
+        In stub mode (when the Google SDK is missing) this returns a
+        dummy description and ``None`` for the finish reason.
+        """
+        if not _HAS_GOOGLE:
+            # Return a generic message; the actual content of ``parts`` is ignored
+            return "[vision service unavailable]", None
+
         gen_cfg = types.GenerateContentConfig(
             temperature=self.cfg.temperature,
             max_output_tokens=self.cfg.max_tokens,
@@ -110,6 +157,7 @@ class GeminiVLM:
             top_k=self.cfg.top_k,
             candidate_count=self.cfg.candidate_count,
             stop_sequences=self.cfg.stop_sequences if self.cfg.stop_sequences else None,
+            # NOTE: We intentionally do NOT set automatic_function_calling here.
         )
         if response_mime_type:
             try:
@@ -134,7 +182,7 @@ class GeminiVLM:
                     model=self.cfg.model,
                     contents=parts,
                     config=gen_cfg,
-                    stream=True,  # type: ignore[arg-type]
+                    stream=True,  # streaming iterator
                 )
                 text, finish_reason = "", None
                 for ev in resp:
@@ -154,9 +202,10 @@ class GeminiVLM:
             except AttributeError:
                 pass
             except Exception:
+                # On any streaming-specific error, fall back to non-streaming
                 pass
 
-        # Non‑streaming path
+        # Non-streaming path
         resp = self.client.models.generate_content(
             model=self.cfg.model, contents=parts, config=gen_cfg
         )
@@ -178,7 +227,7 @@ class GeminiVLM:
         except Exception:
             return s.count("{") != s.count("}")
 
-    # Auto‑continuation loop
+    # Auto-continuation loop
     def _continue_until_done(
         self,
         first_text: str,
@@ -223,7 +272,7 @@ class GeminiVLM:
         lang: str = "English",
         max_words: int = 120,
     ) -> str:
-        """Generate a concise plain‑text description; auto‑continues if truncated."""
+        """Generate a concise plain-text description; auto-continues if truncated."""
         instruction = _SYSTEM_RULES + "\n" + _TASK_TEMPLATE.format(
             task=prompt, lang=lang, fmt="Plain text", max_words=max_words
         )
@@ -252,7 +301,10 @@ class GeminiVLM:
                 return full.strip()
             except Exception as e:
                 last_exc = e
-                time.sleep(self.cfg.retry_base * (2 ** attempt))
+                if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
+                    time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
+                    continue
+                break
         return f"[VLM-ERROR] {last_exc}"
 
     # Public: structured JSON describe
@@ -267,7 +319,7 @@ class GeminiVLM:
         strict_json: bool = True,
         max_words_hint: int = 200,
     ) -> Dict[str, Any]:
-        """Ask for JSON output; validate & auto‑repair. Auto‑continues when truncated."""
+        """Ask for JSON output; validate & auto-repair. Auto-continues when truncated."""
         want_schema = (schema_model is not None) and HAS_PYDANTIC
         json_rule = (
             "Return ONLY valid JSON. Do not include backticks, code fences, or extra text."
@@ -331,13 +383,17 @@ class GeminiVLM:
                 return data
             except Exception as e:
                 last_exc = e
-                base_instruction += f"\nVALIDATION ERROR:\n{e}\nFix and output ONLY valid JSON."
-                time.sleep(self.cfg.retry_base * (2 ** attempt))
+                # Only enrich instruction if we'll retry
+                if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
+                    base_instruction += f"\nVALIDATION ERROR:\n{e}\nFix and output ONLY valid JSON."
+                    time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
+                    continue
+                break
         # Last resort: surface raw error
         return {"_raw": "", "_error": str(last_exc) if last_exc else "unknown"}
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     # Minimal smoke test (requires GOOGLE_API_KEY and a valid JPEG bytes)
     import sys
     print("vlm.py loaded; instantiate GeminiVLM() and call describe()/describe_json().")

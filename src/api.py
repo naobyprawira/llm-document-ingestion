@@ -1,363 +1,509 @@
+# src/api.py
 """
-FastAPI application exposing granular document ingestion endpoints.
+FastAPI application exposing a single /process endpoint that supports:
+- Synchronous mode (default): parse -> chunk -> embed, then respond with 200.
+- Asynchronous mode (async=1): immediately 202 Accepted with job_key; heavy work continues
+  in background using BackgroundTasks. Progress & completion are recorded as a "job_marker"
+  point in Qdrant (payload-filterable), so clients can poll Qdrant without new endpoints.
 
-This API builds upon the upstream pipeline to offer fine‑grained
-operations for clients:
-
-* ``POST /parse``: Parse an uploaded PDF or image. If the file is a
-  PDF, Docling extracts text and images; images are described via
-  ``GeminiVLM`` using the default prompt. The response includes the
-  enriched Markdown and metadata such as author, filename, file type,
-  page count and image count. For images, the VLM generates a single
-  description and returns a simple Markdown snippet.
-
-* ``POST /chunk``: Given a Markdown string, split it into chunks
-  suitable for embedding using the same logic as the upstream
-  ``chunk_markdown`` function. The response returns the list of
-  chunks along with metadata.
-
-* ``POST /embed``: Accepts a JSON list of chunks and uploads them to
-  Qdrant using ``embed_and_upload_json``. Clients may override the
-  target collection. The response returns the number of embedded
-  chunks and timing information.
-
-* ``POST /process``: Accepts an uploaded PDF or image and a category
-  string. Runs ``/parse``, ``/chunk`` and ``/embed`` in sequence. The
-  resulting Markdown, chunks and metadata are written to a temporary
-  folder, zipped and returned as a file response. The metadata
-  includes all fields from ``/parse`` plus the category and
-  processing times for each step.
-
-If any external dependency (Google Gen AI, Qdrant, Docling) raises
-errors, the API returns an HTTP 500 with the exception message. This
-behaviour matches the upstream design and avoids silently ignoring
-failures.
+Env (examples):
+- MAX_CONCURRENT_PARSE: int, limit concurrent parse stages (default: 3)
+- MAX_CONCURRENT_VLM:   int, limit concurrent VLM describe() calls (default: 5)
+- EMBED_BATCH_SIZE:     int, number of chunks per Qdrant upsert batch (default: 64)
+- QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION: Qdrant connection/config
+- LOG_LEVEL:            DEBUG|INFO|WARNING|ERROR (default: INFO)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import time
 import uuid
+import logging
+import warnings
 from datetime import datetime
-from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import List, Dict, Any, Optional
+from tempfile import NamedTemporaryFile
+from typing import List, Dict, Any, Optional, Iterable
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse, FileResponse
-from pydantic import BaseModel
+import anyio
+import asyncio
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks  # type: ignore
+from fastapi.responses import JSONResponse  # type: ignore
+from pydantic import BaseModel  # type: ignore
 
 from .doc_parser import DocParser, Figure
 from .vlm import GeminiVLM, VLMConfig
 from .prompts import default_prompt
 from .markdown import FigureDesc, compose_markdown
 from .chunk import chunk_markdown
-from .embed import embed_and_upload_json, get_genai_embedding
-try:
-    # qdrant_client may not always be installed at runtime
-    from qdrant_client import QdrantClient  # type: ignore
-    from qdrant_client.http import models   # type: ignore
-    _HAS_QDRANT = True
-except Exception:
-    _HAS_QDRANT = False
+from .embed import get_genai_embedding  # low-level embed for batching
 
-app = FastAPI(title="Document Ingestion API")
+
+
+# Silence torch CPU-only pin_memory warning (harmless when no accelerator)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*'pin_memory' argument is set as true but no accelerator is found.*",
+)
+
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+_base_logger = logging.getLogger("ingestion")
+if not _base_logger.handlers:
+    _handler = logging.StreamHandler()
+    _formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s job=%(job)s file=%(file)s phase=%(phase)s msg=%(message)s"
+    )
+    _handler.setFormatter(_formatter)
+    _base_logger.addHandler(_handler)
+_base_logger.setLevel(_LOG_LEVEL)
+
+
+class _Adapter(logging.LoggerAdapter):
+    """Injects job/file/phase keys so our formatter never KeyErrors."""
+    def __init__(self, logger, job="-", file="-", phase="-"):
+        super().__init__(logger, {"job": job, "file": file, "phase": phase})
+
+    def with_phase(self, phase: str) -> "_Adapter":
+        return _Adapter(self.logger, self.extra.get("job", "-"), self.extra.get("file", "-"), phase)
+
+
+def _logger(job: str = "-", file: str = "-", phase: str = "-") -> _Adapter:
+    return _Adapter(_base_logger, job, file, phase)
+# -------------------------------------------------------------------------
+
+
+# ====================== Concurrency controls ======================
+MAX_CONCURRENT_PARSE = int(os.getenv("MAX_CONCURRENT_PARSE", "3"))
+MAX_CONCURRENT_VLM   = int(os.getenv("MAX_CONCURRENT_VLM", "5"))
+EMBED_BATCH_SIZE     = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+
+_PARSE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_PARSE)
+_VLM_SEMAPHORE   = asyncio.Semaphore(MAX_CONCURRENT_VLM)
+# ==================================================================
+
+
+def _ensure_primitive(value: Any) -> Any:
+    """Coerce to JSON-serializable primitive."""
+    if callable(value):
+        try:
+            value = value()
+        except Exception:
+            return str(value)
+    if isinstance(value, dict):
+        return {k: _ensure_primitive(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_ensure_primitive(v) for v in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
 
 
 def _extract_metadata_from_doc(doc: Any) -> Dict[str, Any]:
-    """Attempt to extract common metadata from a Docling document.
-
-    Docling documents expose metadata inconsistently across versions, so
-    this helper tries several attribute names. Missing fields are
-    returned as ``None``.
-
-    :param doc: A ``DoclingDocument`` instance returned by ``DocParser``.
-    :return: Dict with keys ``author`` and ``page_count``.
-    """
-    author = None
-    page_count = None
+    """Extract common metadata from Docling document if present."""
+    author: Optional[str] = None
+    page_count: Optional[int] = None
     try:
         if hasattr(doc, "info"):
             info = getattr(doc, "info")
-            # Docling v2 stores authors as a list
-            if hasattr(info, "authors") and info.authors:
-                author = ", ".join(info.authors)
-            elif hasattr(info, "author") and info.author:
-                author = info.author
-        # Page count may be available directly
-        if hasattr(doc, "page_count"):
-            page_count = getattr(doc, "page_count")
-        elif hasattr(doc, "n_pages"):
-            page_count = getattr(doc, "n_pages")
-        elif hasattr(doc, "num_pages"):
-            page_count = getattr(doc, "num_pages")
+            if hasattr(info, "authors"):
+                try:
+                    authors_val = getattr(info, "authors")
+                    authors = _ensure_primitive(authors_val)
+                    if authors:
+                        if isinstance(authors, (list, tuple, set)):
+                            author = ", ".join([str(a) for a in authors])
+                        else:
+                            author = str(authors)
+                except Exception:
+                    pass
+            if author is None and hasattr(info, "author"):
+                try:
+                    val = getattr(info, "author")
+                    primitive = _ensure_primitive(val)
+                    if primitive:
+                        author = str(primitive)
+                except Exception:
+                    pass
+        for attr in ["page_count", "n_pages", "num_pages"]:
+            if page_count is not None:
+                break
+            if hasattr(doc, attr):
+                try:
+                    val = getattr(doc, attr)
+                    primitive = _ensure_primitive(val)
+                    if primitive is not None:
+                        try:
+                            page_count = int(primitive)  # type: ignore[assignment]
+                        except Exception:
+                            page_count = None
+                except Exception:
+                    pass
     except Exception:
         pass
     return {"author": author, "page_count": page_count}
 
 
-def _parse_document(tmp_path: str, filename: str, ext: str) -> tuple[str, Dict[str, Any]]:
-    """Internal helper to parse a document or image and return markdown and metadata.
+async def _parse_document(
+    tmp_path: str,
+    filename: str,
+    ext: str,
+    image_bytes: bytes | None = None,
+    *,
+    job_key: str,
+) -> tuple[str, Dict[str, Any]]:
+    """Parse a document or image and return (markdown, metadata)."""
+    log = _logger(job=job_key, file=filename, phase="parse")
+    t0 = time.perf_counter()
 
-    :param tmp_path: Path to a temporary file containing the uploaded data.
-    :param filename: Original filename from the upload.
-    :param ext: File extension (lowercase) including the dot.
-    :return: A tuple (markdown, metadata)
-    :raises Exception: Propagated if parsing or description fails.
-    """
-    metadata: Dict[str, Any] = {
-        "filename": filename,
-        "file_type": ext.lstrip("."),
-    }
+    metadata: Dict[str, Any] = {"filename": filename, "file_type": ext.lstrip(".")}
     markdown: str = ""
-    if ext in [".pdf"]:
-        parser = DocParser()
-        doc, base_md, figures = parser.parse(tmp_path)
-        meta_extra = _extract_metadata_from_doc(doc)
-        metadata.update(meta_extra)
-        metadata["images_count"] = len(figures)
-        # Describe images
-        vlm = GeminiVLM(VLMConfig())
-        prompt = default_prompt()
-        descs: List[FigureDesc] = []
-        for f in figures:
-            if len(f.jpeg_bytes) < 5000:
-                text = "Small image (likely logo or decorative element) - skipped"
-            else:
-                text = vlm.describe(f.jpeg_bytes, prompt)
-                retry_count = 0
-                max_retries = 3
-                while (not text or len(text.strip()) < 10) and retry_count < max_retries:
-                    retry_count += 1
-                    text = vlm.describe(f.jpeg_bytes, prompt)
-            if text.startswith("Small image (likely logo or decorative element)"):
-                continue
-            descs.append(FigureDesc(index=f.index, page=f.page, caption=f.caption, description=text))
-        markdown = compose_markdown(base_md, descs)
-    else:
-        # Single image
-        metadata.update({"page_count": 1, "images_count": 1, "author": None})
-        data = open(tmp_path, "rb").read()
-        vlm = GeminiVLM(VLMConfig())
-        prompt = default_prompt()
-        text = vlm.describe(data, prompt)
-        if not text or len(text.strip()) < 1:
-            text = "[No description]"
-        markdown = f"![{filename}]({filename})\n\n{text}"
-    return markdown, metadata
 
-
-def _embed_chunks_with_metadata(
-    chunks: List[str], metadata: Dict[str, Any], collection: str, *, use_uuid: bool = True
-) -> int:
-    """
-    Embed a list of chunks and upload to Qdrant, attaching metadata to each payload.
-
-    This wrapper computes embeddings via ``get_genai_embedding`` and then
-    constructs Qdrant points with payloads that include the original
-    chunk text along with all provided metadata. It reimplements the
-    upsert logic from ``embed.py`` to allow injecting arbitrary keys
-    into the payload. If Qdrant is unavailable, it returns 0.
-
-    :param chunks: List of text chunks to embed.
-    :param metadata: Metadata dict to merge into each payload. Note that keys
-        like ``chunk_index`` and ``dim`` will override existing keys in
-        metadata if present.
-    :param collection: Name of the Qdrant collection.
-    :param use_uuid: Generate UUIDs for point IDs when True; else use
-        deterministic ``<docName>-<index>`` IDs.
-    :return: Number of uploaded embeddings.
-    """
-    if not _HAS_QDRANT:
-        # Qdrant client is not installed; nothing to upload
-        return 0
-    if not chunks:
-        return 0
-    # Compute embeddings
-    vectors: List[List[float]] = []
-    for ch in chunks:
-        # get_genai_embedding may raise if google-genai is not installed
-        vec = get_genai_embedding(ch)
-        vectors.append(vec)
-    # Connect to Qdrant
-    url = os.environ.get("QDRANT_URL")
-    if not url:
-        raise RuntimeError("QDRANT_URL environment variable is not set.")
-    client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
-    vector_size = len(vectors[0])
-    # Create collection if missing
-    try:
-        client.get_collection(collection_name=collection)
-    except Exception:
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE),
-        )
-    # Build points
-    points: List[Dict[str, Any]] = []
-    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
-        if use_uuid:
-            point_id = uuid.uuid4().hex
-        else:
-            # Use filename from metadata if available, else 'doc'
-            prefix = str(metadata.get("filename", "doc")).replace(".", "-")
-            point_id = f"{prefix}-{idx}"
-        # Build payload merging metadata
-        payload = {"text": text, **metadata, "chunk_index": idx, "dim": len(vec)}
-        points.append({"id": point_id, "vector": vec, "payload": payload})
-    client.upsert(collection_name=collection, points=points, wait=True)
-    return len(points)
-
-
-class ChunkRequest(BaseModel):
-    markdown: str
-
-
-class EmbedRequest(BaseModel):
-    chunks: List[str]
-    collection: Optional[str] = None
-
-
-@app.post("/parse")
-async def parse_endpoint(file: UploadFile = File(...)):
-    """Parse and optionally OCR a PDF or image, returning Markdown and metadata."""
-    start_time = time.perf_counter()
-    filename = file.filename or f"upload_{uuid.uuid4().hex}"
-    ext = os.path.splitext(filename)[1].lower()
-    with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-    try:
-        # Delegate to internal helper
-        markdown, metadata = _parse_document(tmp_path, filename, ext)
-        duration = time.perf_counter() - start_time
-        metadata["processing_time_seconds"] = duration
-        metadata["processing_finished_at"] = datetime.now().isoformat()
-        return JSONResponse({"markdown": markdown, "metadata": metadata})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
+    # Try to hint VLM to disable AFC if supported by your wrapper's config
+    cfg = VLMConfig()
+    if hasattr(cfg, "disable_afc"):
         try:
-            os.unlink(tmp_path)
+            setattr(cfg, "disable_afc", True)
         except Exception:
             pass
 
+    if ext == ".pdf":
+        log.info("start: docling.parse")
+        parser = DocParser()
+        # anyio.to_thread.run_sync is the recommended pattern for sync work in async apps
+        doc, base_md, figures = await anyio.to_thread.run_sync(parser.parse, tmp_path)
+        meta_extra = _extract_metadata_from_doc(doc)
+        metadata.update(meta_extra)
 
-@app.post("/chunk")
-async def chunk_endpoint(body: ChunkRequest):
-    """Chunk a Markdown document into segments for embedding."""
-    start_time = time.perf_counter()
+        valid_figures = [f for f in figures if len(f.jpeg_bytes) >= 5000]
+        metadata["images_count"] = len(valid_figures)
+
+        vlm = GeminiVLM(cfg)
+        prompt = default_prompt()
+
+        async def describe_one(f: Figure) -> FigureDesc:
+            async with _VLM_SEMAPHORE:
+                # ONE call only – no local retries based on caption length.
+                text = await anyio.to_thread.run_sync(lambda: vlm.describe(f.jpeg_bytes, prompt))
+                log.info(f"vlm.describe: figure {f.index} completed, text_length={len(text or '')}")
+                return FigureDesc(index=f.index, page=f.page, caption=f.caption, description=text or "")
+
+        if valid_figures:
+            log.info(f"vlm.describe: start, figures={len(valid_figures)} (throttled={MAX_CONCURRENT_VLM})")
+            descs: List[FigureDesc] = await asyncio.gather(*(describe_one(f) for f in valid_figures))
+        else:
+            descs = []
+        markdown = compose_markdown(base_md, descs)
+        log.info(f"done: docling+vlm in {time.perf_counter()-t0:.3f}s pages={metadata.get('page_count')} images={metadata.get('images_count')}")
+    else:
+        log.info("start: image.describe")
+        metadata.update({"page_count": 1, "images_count": 1, "author": None})
+        data = image_bytes if image_bytes is not None else open(tmp_path, "rb").read()
+        vlm = GeminiVLM(cfg)
+        prompt = default_prompt()
+        async with _VLM_SEMAPHORE:
+            text = await anyio.to_thread.run_sync(lambda: vlm.describe(data, prompt))
+        markdown = f"![{filename}]({filename})\n\n{(text or '').strip() or '[No description]'}"
+        log.info(f"done: image.describe in {time.perf_counter()-t0:.3f}s")
+
+    return markdown, metadata
+
+
+def _batched(seq: List[Any], size: int) -> Iterable[List[Any]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+# ---- Qdrant client (per current quickstart examples) ----
+try:
+    from qdrant_client import QdrantClient  # type: ignore
+    from qdrant_client.http.models import VectorParams, Distance, PointStruct  # docs show http.models in quickstart
+    _HAS_QDRANT = True
+except Exception:
+    _HAS_QDRANT = False
+
+
+def _qdrant_client() -> QdrantClient:
+    url = os.environ.get("QDRANT_URL")
+    if not url:
+        raise RuntimeError("QDRANT_URL environment variable is not set.")
+    return QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
+
+
+def _ensure_collection(client: QdrantClient, collection: str, vector_size: int) -> None:
+    # Prefer collection_exists() per client docs
+    if not client.collection_exists(collection):
+        client.create_collection(
+            collection_name=collection,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+
+
+def _marker_point(job_key: str,
+                  vector: List[float],
+                  filename: str,
+                  category: str,
+                  collection: str,
+                  status: str,
+                  expected_chunks: Optional[int],
+                  uploaded_chunks: int,
+                  error: Optional[str] = None) -> PointStruct:
+    payload = {
+        "type": "job_marker",
+        "job_key": job_key,
+        "filename": filename,
+        "category": category,
+        "collection": collection,
+        "status": status,  # "running" | "done" | "failed"
+        "expected_chunks": expected_chunks,
+        "uploaded_chunks": uploaded_chunks,
+        "finished_at": None,
+    }
+    if status in ("done", "failed"):
+        payload["finished_at"] = datetime.now().isoformat()
+    if error:
+        payload["error"] = str(error)
+    return PointStruct(id=f"marker-{job_key}", vector=vector, payload=payload)
+
+
+def _embed_texts_get_vectors(texts: List[str]) -> List[List[float]]:
+    """Synchronous helper to embed a batch of texts."""
+    return [get_genai_embedding(t) for t in texts]
+
+
+async def _process_job_async(
+    data: bytes,
+    filename: str,
+    ext: str,
+    category: str,
+    collection_name: str,
+    job_key: str,
+) -> None:
+    """
+    Background pipeline:
+    parse (gated) -> chunk -> embed (batched) -> job_marker updates.
+    Runs after 202 Accepted has been sent to the client.
+    """
+    log = _logger(job=job_key, file=filename, phase="background")
+    client: Optional[QdrantClient] = None
+    marker_vec: Optional[List[float]] = None
+    uploaded = 0
+    expected: Optional[int] = None
+    t_overall = time.perf_counter()
+
     try:
-        chunks: List[str] = chunk_markdown(body.markdown)
-        duration = time.perf_counter() - start_time
-        metadata = {
-            "chunks_count": len(chunks),
-            "processing_time_seconds": duration,
-            "processing_finished_at": datetime.now().isoformat(),
-        }
-        return JSONResponse({"chunks": chunks, "metadata": metadata})
+        # -------- PARSE (gated) --------
+        t0 = time.perf_counter()
+        async with _PARSE_SEMAPHORE:
+            if ext == ".pdf":
+                with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                try:
+                    markdown, metadata = await _parse_document(tmp_path, filename, ext, job_key=job_key)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            else:
+                markdown, metadata = await _parse_document("", filename, ext, image_bytes=data, job_key=job_key)
+        log.with_phase("parse").info(f"completed in {time.perf_counter() - t0:.3f}s")
+
+        # -------- CHUNK (offloaded) --------
+        t1 = time.perf_counter()
+        chunks: List[str] = await anyio.to_thread.run_sync(chunk_markdown, markdown)
+        expected = len(chunks)
+        log.with_phase("chunk").info(f"completed count={expected} in {time.perf_counter()-t1:.3f}s")
+
+        if not _HAS_QDRANT or not chunks:
+            log.with_phase("embed").warning("skipped (no Qdrant or no chunks)")
+            return
+
+        # Prepare Qdrant client and marker vector (ensure collection)
+        client = _qdrant_client()
+        marker_vec = get_genai_embedding("job_marker")
+        _ensure_collection(client, collection_name, len(marker_vec))
+
+        # Upsert initial marker as "running"
+        client.upsert(
+            collection_name=collection_name,
+            points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "running", expected, uploaded)],
+            wait=True,
+        )
+        log.with_phase("embed").info(f"start: total_chunks={expected} batch_size={EMBED_BATCH_SIZE}")
+
+        # -------- EMBED & UPSERT IN BATCHES --------
+        chunk_index_offset = 0
+        for batch in _batched(chunks, EMBED_BATCH_SIZE):
+            tb = time.perf_counter()
+            vectors = await anyio.to_thread.run_sync(_embed_texts_get_vectors, batch)
+
+            # Build Qdrant points for this batch
+            points: List[PointStruct] = []
+            for i, (text, vec) in enumerate(zip(batch, vectors)):
+                idx = chunk_index_offset + i
+                payload = {"filename": filename, "category": category, "chunk_index": idx, "dim": len(vec)}
+                points.append(PointStruct(id=uuid.uuid4().hex, vector=vec, payload=payload))
+
+            client.upsert(collection_name=collection_name, points=points, wait=True)
+            uploaded += len(points)
+
+            # Update progress marker
+            client.upsert(
+                collection_name=collection_name,
+                points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "running", expected, uploaded)],
+                wait=True,
+            )
+            log.with_phase("embed").info(f"batch uploaded={len(points)} total_uploaded={uploaded} took={time.perf_counter()-tb:.3f}s")
+            chunk_index_offset += len(batch)
+
+        # Mark as done
+        client.upsert(
+            collection_name=collection_name,
+            points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "done", expected, uploaded)],
+            wait=True,
+        )
+        log.with_phase("embed").info(f"completed total_uploaded={uploaded} overall={time.perf_counter()-t_overall:.3f}s")
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        if client and marker_vec:
+            try:
+                client.upsert(
+                    collection_name=collection_name,
+                    points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "failed", expected, uploaded, error=str(e))],
+                    wait=True,
+                )
+            except Exception:
+                pass
+        _logger(job=job_key, file=filename, phase="error").exception(f"pipeline failed: {e}")
 
 
-@app.post("/embed")
-async def embed_endpoint(body: EmbedRequest):
-    """Embed a list of text chunks and upload them to Qdrant."""
-    start_time = time.perf_counter()
-    try:
-        collection = body.collection or os.getenv("QDRANT_COLLECTION", "documents")
-        # Use the simple embed function for generic embed calls (no metadata)
-        count = embed_and_upload_json(body.chunks, collection=collection)
-        duration = time.perf_counter() - start_time
-        metadata = {
-            "uploaded_chunks": count,
-            "collection": collection,
-            "processing_time_seconds": duration,
-            "processing_finished_at": datetime.now().isoformat(),
-        }
-        return JSONResponse({"metadata": metadata})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# ----------------------------- FastAPI app -----------------------------
+app = FastAPI(title="Document Ingestion API")
+
+
+class _ProcessResponse(BaseModel):
+    # For 202 response
+    status: str
+    job_key: str
+    filename: str
+    category: str
+    collection: str
 
 
 @app.post("/process")
 async def process_endpoint(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    category: str = Form(..., description="Custom category to attach to the metadata"),
+    category: str = Form(...),
+    async_mode: Optional[str] = Form(default=None),
 ):
-    """Run the full ingestion pipeline and return a zip of results.
-
-    This endpoint runs ``/parse``, ``/chunk`` and ``/embed`` in sequence on
-    the uploaded file. The supplied ``category`` is added to the
-    metadata. A temporary directory is created where the enriched
-    Markdown (``document.md``), chunks JSON (``chunks.json``) and
-    metadata JSON (``metadata.json``) are written. The directory is
-    then zipped and returned as a file response. Clients can save and
-    extract the archive to inspect the outputs.
     """
-    overall_start = time.perf_counter()
+    Mode A (default): Full pipeline and respond when completed (HTTP 200).
+    Mode B (async=1): Respond immediately (HTTP 202) & run pipeline in background.
+    """
     filename = file.filename or f"upload_{uuid.uuid4().hex}"
     ext = os.path.splitext(filename)[1].lower()
-    with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    collection_name = os.getenv("QDRANT_COLLECTION", "documents")
+
+    # Read bytes NOW (UploadFile temp may be deleted after response)
+    data = await file.read()
+
+    is_async = str(async_mode).strip().lower() in {"1", "true", "yes"}
+
+    if is_async:
+        # ---------- Mode B: fire-and-poll ----------
+        job_key = uuid.uuid4().hex
+        _logger(job=job_key, file=filename, phase="accept").info("accepted async job")
+        # FastAPI BackgroundTasks: runs after the response has been sent
+        background_tasks.add_task(
+            _process_job_async,
+            data,
+            filename,
+            ext,
+            category,
+            collection_name,
+            job_key,
+        )
+        return JSONResponse(
+            status_code=202,
+            content=_ProcessResponse(
+                status="accepted",
+                job_key=job_key,
+                filename=filename,
+                category=category,
+                collection=collection_name,
+            ).model_dump(),  # Pydantic v2
+        )
+
+    # ---------- Mode A: synchronous pipeline ----------
+    job_key = uuid.uuid4().hex
+    log = _logger(job=job_key, file=filename, phase="sync")
+    t_overall = time.perf_counter()
     try:
-        # Step 1: parse directly using helper
-        markdown, metadata = _parse_document(tmp_path, filename, ext)
-        metadata["category"] = category
-        # Record parse timing separately
-        # Step 2: chunk
-        chunk_start = time.perf_counter()
-        chunks: List[str] = chunk_markdown(markdown)
-        chunk_duration = time.perf_counter() - chunk_start
-        # Step 3: embed with metadata
-        embed_start = time.perf_counter()
-        collection_name = os.getenv("QDRANT_COLLECTION", "documents")
-        try:
-            embed_count = _embed_chunks_with_metadata(chunks, metadata, collection_name)
-        except Exception as ex:
-            # If embedding fails, still produce zip but note the error in metadata
-            metadata.setdefault("embedding_error", str(ex))
-            embed_count = 0
-        embed_duration = time.perf_counter() - embed_start
-        # Aggregate metadata
-        metadata["embedding_info"] = {
-            "uploaded_chunks": embed_count,
+        # PARSE (gated by semaphore)
+        t0 = time.perf_counter()
+        async with _PARSE_SEMAPHORE:
+            if ext == ".pdf":
+                with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                try:
+                    markdown, metadata = await _parse_document(tmp_path, filename, ext, job_key=job_key)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            else:
+                markdown, metadata = await _parse_document("", filename, ext, image_bytes=data, job_key=job_key)
+        log.with_phase("parse").info(f"completed in {time.perf_counter()-t0:.3f}s")
+
+        # CHUNK (offload)
+        t1 = time.perf_counter()
+        chunks: List[str] = await anyio.to_thread.run_sync(chunk_markdown, markdown)
+        log.with_phase("chunk").info(f"completed count={len(chunks)} in {time.perf_counter()-t1:.3f}s")
+
+        # EMBED batched (offload embedding loop)
+        uploaded = 0
+        if _HAS_QDRANT and chunks:
+            client = _qdrant_client()
+            marker_vec = get_genai_embedding("marker")
+            _ensure_collection(client, collection_name, len(marker_vec))
+
+            chunk_index_offset = 0
+            for batch in _batched(chunks, EMBED_BATCH_SIZE):
+                tb = time.perf_counter()
+                vectors = await anyio.to_thread.run_sync(_embed_texts_get_vectors, batch)
+                points: List[PointStruct] = []
+                for i, (text, vec) in enumerate(zip(batch, vectors)):
+                    idx = chunk_index_offset + i
+                    payload = {"filename": filename, "category": category, "chunk_index": idx, "dim": len(vec)}
+                    points.append(PointStruct(id=uuid.uuid4().hex, vector=vec, payload=payload))
+                client.upsert(collection_name=collection_name, points=points, wait=True)
+                uploaded += len(points)
+                chunk_index_offset += len(batch)
+                log.with_phase("embed").info(f"batch uploaded={len(points)} total_uploaded={uploaded} took={time.perf_counter()-tb:.3f}s")
+
+        log.with_phase("embed").info(f"completed total_uploaded={uploaded} overall={time.perf_counter()-t_overall:.3f}s")
+        return JSONResponse({
+            "file_name": filename,
+            "file_type": metadata.get("file_type"),
+            "page_count": metadata.get("page_count"),
+            "images_count": metadata.get("images_count"),
+            "uploaded_chunks": uploaded,
             "collection": collection_name,
-            "processing_time_seconds": embed_duration,
-            "processing_finished_at": datetime.now().isoformat(),
-        }
-        metadata["chunking_info"] = {
-            "chunks_count": len(chunks),
-            "processing_time_seconds": chunk_duration,
-        }
-        metadata["overall_processing_time_seconds"] = time.perf_counter() - overall_start
-        metadata["processing_finished_at"] = datetime.now().isoformat()
-        # Prepare zip file
-        with TemporaryDirectory() as tmpdir:
-            md_path = os.path.join(tmpdir, "document.md")
-            json_path = os.path.join(tmpdir, "chunks.json")
-            meta_path = os.path.join(tmpdir, "metadata.json")
-            with open(md_path, "w", encoding="utf‑8") as f:
-                f.write(markdown)
-            with open(json_path, "w", encoding="utf‑8") as f:
-                json.dump(chunks, f, ensure_ascii=False, indent=2)
-            with open(meta_path, "w", encoding="utf‑8") as f:
-                json.dump(metadata, f, ensure_ascii=False, indent=2)
-            # Create a persistent temp file for the zip outside of the context manager
-            tmp_zip = NamedTemporaryFile(delete=False, suffix=".zip")
-            tmp_zip.close()
-            shutil.make_archive(base_name=tmp_zip.name[:-4], format="zip", root_dir=tmpdir)
-            zip_file_path = tmp_zip.name
-            return FileResponse(zip_file_path, filename=os.path.basename(zip_file_path), media_type="application/zip")
-    except HTTPException:
-        raise
+            "total_processing_seconds": time.perf_counter() - t_overall,
+            "category": category,
+        })
     except Exception as e:
+        log.with_phase("error").exception(f"pipeline failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
