@@ -1,0 +1,12 @@
+docling
+fastapi
+uvicorn[standard]
+python-multipart
+google-genai
+python-dotenv
+pydantic
+httpx
+requests
+tqdm
+pypdf
+qdrant-client
