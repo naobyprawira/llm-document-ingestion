@@ -1,85 +1,61 @@
-#!/usr/bin/env python3
-"""
-Embed pre‑chunked text and load embeddings into Qdrant.
+"""Embedding utilities for text chunks.
 
-This module exposes high‑level helpers for taking a list of text
-``chunks`` in memory, obtaining embeddings via Google’s Gen AI SDK
-(``GeminiVLM``) and upserting the resulting vectors into a Qdrant
-collection. It can also load chunks from a JSON file on disk. These
-helpers are used by the API layer to persist processed documents.
+Public API:
+- get_genai_embedding(text, model_name=...) -> List[float]
+- embed_chunks(...) -> int  # embed ALL chunks and upsert in ONE call
 
-Environment variables:
-
-``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``
-    The key used by the Google Gen AI SDK. At least one of these must
-    be set or calls to ``get_genai_embedding`` will raise an error.
-
-``QDRANT_URL`` (required) and ``QDRANT_API_KEY`` (optional)
-    Connection information for the Qdrant instance. If ``QDRANT_URL``
-    is not set, ``upsert_vectors`` will raise a ``RuntimeError``.
-
-``QDRANT_COLLECTION`` (optional)
-    Default collection name used when not explicitly supplied.
-
-The core logic here mirrors the upstream implementation; it has not
-been modified beyond formatting and comments for clarity.
+Notes:
+- Vector search uses the dedicated `vector` field in Qdrant (not payload).
+- We store the chunk `text` + rich metadata in payload for retrieval & filters.
+- Payload indexes are created for: filename, job_key, file_type, category.
+- We now strip file extensions from the stored `filename` (basename only).
 """
 
 from __future__ import annotations
 
-import argparse
-import json
+from typing import List
 import os
 import uuid
-from typing import List, Dict, Any, Optional
+import time
 
-from dotenv import load_dotenv
-
-# Ensure environment variables are loaded before using google/qdrant clients
-load_dotenv()
-
-# Lightweight progress bar fallback – tqdm is optional
 try:
-    from tqdm import tqdm  # type: ignore
-except ImportError:  # pragma: no cover
-    def tqdm(iterable, *args, **kwargs):  # type: ignore
-        return iterable
-
-
-def load_chunks(path: str) -> List[str]:
-    """Load a list of text chunks from a JSON file.
-
-    :param path: Path to a JSON file containing a list of strings.
-    :return: List of strings extracted from the JSON list.
-    :raises ValueError: If the file does not contain a list.
-    """
-    with open(path, "r", encoding="utf‑8") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError(f"{path} must contain a JSON list of strings.")
-    return [str(x) for x in data]
-
-
-def get_genai_embedding(text: str, model_name: str = "gemini-embedding-001") -> List[float]:
-    """Obtain an embedding vector for the given text using Google's Gen AI SDK.
-
-    :param text: The text to embed.
-    :param model_name: Embedding model (e.g. ``gemini‑embedding‑001`` or
-        ``text‑embedding‑004``).
-    :return: A list of floats representing the embedding vector.
-    :raises ImportError: If google‑genai is not installed.
-    :raises RuntimeError: If the API response does not contain embeddings.
-    """
+    from qdrant_client import QdrantClient  # type: ignore
+    from qdrant_client.http.models import PointStruct  # type: ignore
     try:
-        from google import genai  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "google‑genai is not installed. Install with: pip install google‑genai"
-        ) from exc
+        from qdrant_client.http import models as rest  # type: ignore
+        KEYWORD_SCHEMA = getattr(rest.PayloadSchemaType, "KEYWORD", "keyword")
+    except Exception:
+        KEYWORD_SCHEMA = "keyword"
+    _HAS_QDRANT = True
+except Exception:
+    QdrantClient = object  # type: ignore
+    PointStruct = object  # type: ignore
+    KEYWORD_SCHEMA = "keyword"
+    _HAS_QDRANT = False
 
-    client = genai.Client()  # uses GEMINI_API_KEY or GOOGLE_API_KEY from env
-    resp = client.models.embed_content(model=model_name, contents=[text])
-    embeddings = getattr(resp, "embeddings", None)
+from .qdrant_utils import ensure_collection, marker_point
+from .logger import get_logger
+
+
+# --- Google GenAI embedding (mirrors upstream call style) ---
+def get_genai_embedding(text: str, model_name: str | None = None) -> List[float]:
+    """
+    Return a single embedding vector for `text` using google-genai.
+
+    Uses client.models.embed_content(). Default model can be set via
+    GENAI_EMBED_MODEL; fallback 'gemini-embedding-001'.
+    """
+    from google import genai  # type: ignore
+
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY") or ""
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY (or GENAI_API_KEY) is not set")
+
+    client = genai.Client(api_key=api_key)
+    model = model_name or os.getenv("GENAI_EMBED_MODEL", "gemini-embedding-001")
+
+    response = client.models.embed_content(model=model, contents=[text])
+    embeddings = getattr(response, "embeddings", None)
     if not embeddings:
         raise RuntimeError("Gen AI embed_content returned no embeddings.")
     vec = getattr(embeddings[0], "values", None)
@@ -88,168 +64,142 @@ def get_genai_embedding(text: str, model_name: str = "gemini-embedding-001") -> 
     return vec
 
 
-def upsert_vectors(
+def _ensure_payload_indexes(client: QdrantClient, collection: str) -> None:
+    """
+    Create payload indexes for fields we filter on.
+    Safe to call repeatedly; server-side creation is idempotent.
+    """
+    # Add "type" so filters like {"key":"type","match":{"value":"job_marker"}} work
+    fields = ("filename", "job_key", "file_type", "category", "type")
+
+    for field in fields:
+        try:
+            client.create_payload_index(
+                collection_name=collection,
+                field_name=field,
+                field_schema=KEYWORD_SCHEMA,  # "keyword" schema for exact-match filters
+                wait=True,
+            )
+        except Exception:
+            # Ignore "already exists" or similar benign errors
+            pass
+
+
+def embed_chunks(
+    *,
     chunks: List[str],
-    vectors: List[List[float]],
+    filename: str,
+    category: str,
     collection: str,
-    *,
-    id_prefix: Optional[str] = None,
-    use_uuid: bool = True,
-) -> None:
-    """Upsert vectors into a Qdrant collection with payloads.
-
-    :param chunks: The text chunks that were embedded.
-    :param vectors: The corresponding embedding vectors.
-    :param collection: Name of the Qdrant collection.
-    :param id_prefix: Optional prefix used when ``use_uuid`` is False to
-        generate stable IDs based on the document name.
-    :param use_uuid: If True, generate random UUIDs for each vector ID; if
-        False, use deterministic ``<id_prefix>-<index>`` IDs.
-    """
-    try:
-        from qdrant_client import QdrantClient  # type: ignore
-        from qdrant_client.http import models   # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "qdrant-client is not installed. Install with: pip install qdrant-client"
-        ) from exc
-
-    url = os.environ.get("QDRANT_URL")
-    if not url:
-        raise RuntimeError("QDRANT_URL environment variable is not set.")
-    client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
-
-    if not vectors:
-        return
-
-    vector_size = len(vectors[0])
-
-    # Create collection if it doesn't already exist
-    try:
-        client.get_collection(collection_name=collection)
-    except Exception:
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE),
-        )
-
-    # Build points with unique IDs
-    points: List[Dict[str, Any]] = []
-    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
-        if use_uuid:
-            point_id = uuid.uuid4().hex
-        else:
-            point_id = f"{id_prefix or 'doc'}-{idx}"
-        points.append(
-            {
-                "id": point_id,
-                "vector": vec,
-                "payload": {
-                    "text": text,
-                    "source": id_prefix,
-                    "chunk_index": idx,
-                    "dim": len(vec),
-                },
-            }
-        )
-
-    # Upsert points; wait=True ensures write completes before returning
-    client.upsert(collection_name=collection, points=points, wait=True)
-
-
-def embed_and_upload_json(
-    chunks: List[str],
-    collection: str = os.getenv("QDRANT_COLLECTION", "documents"),
-    model_name: str = "gemini-embedding-001",
-    *,
-    id_prefix: Optional[str] = None,
-    use_uuid: bool = True,
+    job_key: str,                  # UUID string
+    client: QdrantClient,
+    file_type: str | None = None,  # e.g., "pdf", "png"
+    wait: bool = True,
 ) -> int:
-    """Embed an in‑memory list of text chunks and upload to Qdrant.
-
-    :param chunks: List[str] of text to embed.
-    :param collection: Qdrant collection name. Defaults to the
-        ``QDRANT_COLLECTION`` env var or ``documents``.
-    :param model_name: Name of the embedding model.
-    :param id_prefix: If ``use_uuid`` is False, prefix used to build stable
-        IDs based on the document name.
-    :param use_uuid: Use randomly generated UUID IDs when True; else use
-        deterministic IDs.
-    :return: The number of uploaded embeddings.
     """
+    Embed ALL chunks and upload them to Qdrant in a single upsert call.
+
+    - Stores the embedding in point.vector (for similarity search).
+    - Stores `text` and rich metadata in payload for retrieval & filtering.
+    - Optionally duplicates the embedding into payload if EMBED_IN_PAYLOAD=1.
+    - Stores `filename` **without extension** (basename).
+    """
+    log = get_logger(job=job_key, file=filename, phase="embed")
+
     if not chunks:
+        log.warning("No chunks to embed; skipping upsert.")
         return 0
-    vectors: List[List[float]] = []
-    for ch in tqdm(chunks, desc="Embedding chunks"):
-        vectors.append(get_genai_embedding(ch, model_name=model_name))
-    upsert_vectors(chunks, vectors, collection=collection, id_prefix=id_prefix, use_uuid=use_uuid)
-    return len(chunks)
 
+    t0 = time.perf_counter()
 
-def embed_and_upload_file(
-    input_path: str,
-    collection: str,
-    model_name: str = "gemini-embedding-001",
-    *,
-    use_uuid: bool = True,
-) -> int:
-    """Load chunks from a JSON file, embed them, and upload to Qdrant.
+    # Normalize filenames: remove extension for stored name
+    filename_base = os.path.splitext(filename)[0]  # root without extension
 
-    :param input_path: Path to a JSON file containing a list of strings.
-    :param collection: Qdrant collection name.
-    :param model_name: Embedding model name.
-    :param use_uuid: Use randomly generated UUID IDs when True; else use
-        deterministic ``<documentName>-<index>`` IDs.
-    :return: Number of uploaded embeddings.
-    """
-    chunks = load_chunks(input_path)
-    id_prefix = None
-    if not use_uuid:
-        id_prefix = os.path.splitext(os.path.basename(input_path))[0]
-    return embed_and_upload_json(
-        chunks,
-        collection=collection,
-        model_name=model_name,
-        id_prefix=id_prefix,
-        use_uuid=use_uuid,
+    # 1) Prepare collection + indexes (+ marker)
+    marker_vec = get_genai_embedding("job_marker")
+    ensure_collection(client, collection, len(marker_vec))
+    _ensure_payload_indexes(client, collection)
+
+    # Initial progress marker (running, 0 uploaded) — use basename
+    client.upsert(
+        collection_name=collection,
+        points=[
+            marker_point(
+                job_key=job_key,
+                vector=marker_vec,
+                filename=filename_base,   # << no extension stored
+                category=category,
+                collection=collection,
+                status="running",
+                expected_chunks=len(chunks),
+                uploaded_chunks=0,
+            )
+        ],
+        wait=True,
     )
 
+    # 2) Embed all chunks synchronously
+    embed_model = os.getenv("GENAI_EMBED_MODEL", "gemini-embedding-001")
+    vectors = [get_genai_embedding(text, model_name=embed_model) for text in chunks]
 
-def main() -> None:
-    """CLI entrypoint for embedding chunks from a file and uploading them."""
-    parser = argparse.ArgumentParser(description="Embed chunks and upload to Qdrant.")
-    parser.add_argument("--input", required=True, help="Path to JSON file with text chunks")
-    parser.add_argument(
-        "--collection",
-        required=False,
-        default=os.environ.get("QDRANT_COLLECTION"),
-        help="Qdrant collection name (or set QDRANT_COLLECTION env var)",
+    # 3) Build points; include all indexed fields + text + metadata
+    ft = (file_type or os.path.splitext(filename)[1].lstrip(".") or "").lower()
+    include_vec_in_payload = (os.getenv("EMBED_IN_PAYLOAD", "0") == "1")
+    now_ts = int(time.time())
+
+    points: List[PointStruct] = []
+    for idx, (text, vec) in enumerate(zip(chunks, vectors)):
+        payload = {
+            "text": text,
+            "category": category,
+            "text_len": len(text),
+            "filename": filename_base,
+            "file_type": ft,# << no extension stored
+            "job_key": job_key,
+            "chunk_index": idx,
+            "embedding_model": embed_model,
+            "embedding_dim": len(vec),
+            "embedding_ts": now_ts,
+        }
+        if include_vec_in_payload:
+            payload["embedding"] = vec  # optional duplication; off by default
+
+        points.append(
+            PointStruct(
+                id=uuid.uuid4().hex,
+                vector=vec,          # used for vector search
+                payload=payload,     # text + metadata
+            )
+        )
+
+    # 4) Single upsert with all points
+    client.upsert(collection_name=collection, points=points, wait=wait)
+
+    # 5) Final progress marker (done)
+    client.upsert(
+        collection_name=collection,
+        points=[
+            marker_point(
+                job_key=job_key,
+                vector=marker_vec,
+                filename=filename_base,   # << no extension stored
+                category=category,
+                collection=collection,
+                status="done",
+                expected_chunks=len(chunks),
+                uploaded_chunks=len(points),
+            )
+        ],
+        wait=True,
     )
-    parser.add_argument(
-        "--model",
-        default="gemini-embedding-001",
-        help="Embedding model name (e.g., gemini-embedding-001, text-embedding-004)",
+
+    log.info(
+        f"embed_chunks done uploaded={len(points)} took={time.perf_counter()-t0:.3f}s"
     )
-    parser.add_argument(
-        "--id-scheme",
-        choices=["uuid", "prefix"],
-        default="uuid",
-        help="Point ID scheme: 'uuid' (default) or 'prefix' (= <docName>-<idx>).",
-    )
-    args = parser.parse_args()
-
-    if not args.collection:
-        raise SystemExit("ERROR: --collection is required (or set QDRANT_COLLECTION).")
-
-    use_uuid = args.id_scheme == "uuid"
-    count = embed_and_upload_file(
-        input_path=args.input,
-        collection=args.collection,
-        model_name=args.model,
-        use_uuid=use_uuid,
-    )
-    print(f"Uploaded {count} embeddings to Qdrant collection '{args.collection}'.")
+    return len(points)
 
 
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "get_genai_embedding",
+    "embed_chunks",
+]

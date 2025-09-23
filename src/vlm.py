@@ -1,45 +1,53 @@
-#!/usr/bin/env python3
 """
 Visual language model wrapper using Google’s Gemini API.
 
 This module provides a ``GeminiVLM`` class that wraps the Google
 Generative AI SDK (``google.genai``) to describe images using a
-language model. It includes retry logic, streaming support and
-auto-continuation to handle truncated responses. Configuration is
-controlled via the ``VLMConfig`` dataclass, which reads defaults
-from environment variables. The implementation below matches the
-upstream code with small improvements:
-- Retries trigger only on transient failures (429/500/502/503/504, timeouts).
-- Optional client timeout via HttpOptions (VLMConfig.timeout_ms).
-- AFC config is NOT set (no explicit disable/enable).
+language model.  It includes retry logic, streaming support and
+auto-continuation to handle truncated responses.  Configuration is
+controlled via the :class:`VLMConfig` dataclass, which reads defaults
+from environment variables.  The implementation here is copied from
+the upstream project and remains synchronous.
+
+To use this class simply instantiate it with a configuration and call
+:meth:`describe` with JPEG bytes and a prompt.
 """
 
 from __future__ import annotations
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import time
 import json
 import random
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Type
 
+# Attempt to import the Google generative AI SDK.  If unavailable
+# fallback behaviours are provided.
 try:
     from google import genai  # type: ignore
     from google.genai import types  # type: ignore
     try:
-        # Typed error classes (present in google-genai)
         from google.genai import errors as genai_errors  # type: ignore
     except Exception:
         genai_errors = None  # type: ignore
     _HAS_GOOGLE = True
 except Exception:
-    # When the Google Generative AI SDK is unavailable, stub out the imports
     genai = None  # type: ignore
     types = None  # type: ignore
     genai_errors = None  # type: ignore
     _HAS_GOOGLE = False
 
-from .prompts import default_prompt
+# ✨ All prompt text now lives in prompts.py
+from .prompts import (
+    DEFAULT_SYSTEM_RULES,
+    build_text_instruction,
+    build_json_instruction,
+    continue_text_instruction,
+    continue_json_instruction,
+)
 
 # Optional import of Pydantic for structured JSON validation
 try:
@@ -51,9 +59,9 @@ except Exception:
 
 @dataclass
 class VLMConfig:
-    """Configuration for ``GeminiVLM``. All values can be overridden via env vars."""
+    """Configuration for :class:`GeminiVLM`.  Values are loaded from environment vars."""
     api_key: str = os.getenv("GOOGLE_API_KEY", "")
-    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     max_tokens: int = int(os.getenv("VLM_MAX_TOKENS", "1512"))
     temperature: float = float(os.getenv("VLM_TEMPERATURE", "0.2"))
     top_p: float = float(os.getenv("VLM_TOP_P", "0.9"))
@@ -64,33 +72,9 @@ class VLMConfig:
             os.getenv("VLM_STOP", "").split("|") if os.getenv("VLM_STOP") else []
         )
     )
-    # Retry/backoff
     retry_max: int = int(os.getenv("RETRY_MAX", "5"))
     retry_base: float = float(os.getenv("RETRY_BASE_SEC", "0.8"))
-    # Optional HTTP timeout for the SDK client (milliseconds)
     timeout_ms: Optional[int] = int(os.getenv("GENAI_TIMEOUT_MS", "0")) or None
-
-
-# System rules and task template used to frame prompts to the model
-_SYSTEM_RULES = """\
-You are an image description assistant.
-Follow these rules:
-- Be concise and factual. If unsure, say you are unsure.
-- Do not include hidden reasoning or chain-of-thought.
-- Do not invent text in the image. If text is unreadable, say it.
-- Respect the requested output format exactly.
-"""
-
-_TASK_TEMPLATE = """\
-TASK:
-{task}
-
-CONSTRAINTS:
-- Language: {lang}
-- Output format: {fmt}
-- Max length guideline: {max_words} words (not enforced if JSON).
-If you are uncertain, set fields to null or empty rather than guessing.
-"""
 
 
 def _is_transient_error(e: Exception) -> bool:
@@ -149,7 +133,6 @@ class GeminiVLM:
         if not _HAS_GOOGLE:
             # Return a generic message; the actual content of ``parts`` is ignored
             return "[vision service unavailable]", None
-
         gen_cfg = types.GenerateContentConfig(
             temperature=self.cfg.temperature,
             max_output_tokens=self.cfg.max_tokens,
@@ -157,15 +140,26 @@ class GeminiVLM:
             top_k=self.cfg.top_k,
             candidate_count=self.cfg.candidate_count,
             stop_sequences=self.cfg.stop_sequences if self.cfg.stop_sequences else None,
-            # NOTE: We intentionally do NOT set automatic_function_calling here.
         )
         if response_mime_type:
             try:
                 gen_cfg.response_mime_type = response_mime_type  # type: ignore[attr-defined]
             except Exception:
                 pass
-
-        def _extract_nonstream(resp) -> tuple[str, Optional[str]]:
+        if stream:
+            resp = self.client.text.partials_generate(
+                model=self.cfg.model, content=parts, generation_config=gen_cfg
+            )
+            out = ""
+            finish = None
+            for partial in resp:
+                out += partial.text or ""
+                finish = getattr(partial, "finish_reason", None) or getattr(partial, "finishReason", None)
+            return out, finish
+        else:
+            resp = self.client.text.generate(
+                model=self.cfg.model, content=parts, generation_config=gen_cfg
+            )
             text = (getattr(resp, "text", "") or "").strip()
             fr = None
             try:
@@ -175,77 +169,29 @@ class GeminiVLM:
                 pass
             return text, fr
 
-        # Try streaming first, then gracefully fall back
-        if stream:
-            try:
-                resp = self.client.models.generate_content(
-                    model=self.cfg.model,
-                    contents=parts,
-                    config=gen_cfg,
-                    stream=True,  # streaming iterator
-                )
-                text, finish_reason = "", None
-                for ev in resp:
-                    if hasattr(ev, "text") and ev.text:
-                        text += ev.text
-                    if getattr(ev, "candidates", None):
-                        try:
-                            cand0 = ev.candidates[0]
-                            fr = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
-                            if fr:
-                                finish_reason = fr
-                        except Exception:
-                            pass
-                return text.strip(), finish_reason
-            except TypeError:
-                pass
-            except AttributeError:
-                pass
-            except Exception:
-                # On any streaming-specific error, fall back to non-streaming
-                pass
+    def _looks_incomplete_text(self, text: str) -> bool:
+        """Heuristic: check if a text response looks incomplete."""
+        return not text or len(text.strip()) < 3 or text.strip().endswith(",")
 
-        # Non-streaming path
-        resp = self.client.models.generate_content(
-            model=self.cfg.model, contents=parts, config=gen_cfg
-        )
-        return _extract_nonstream(resp)
+    def _looks_incomplete_json(self, text: str) -> bool:
+        """Heuristic: check if a JSON response might be truncated."""
+        txt = text.strip()
+        return not txt or txt.count("{") > txt.count("}")
 
-    # Heuristics for detecting incomplete text/JSON
-    @staticmethod
-    def _looks_incomplete_text(s: str) -> bool:
-        if not s:
-            return True
-        trimmed = s.rstrip()
-        return (len(trimmed) > 120) and (trimmed[-1] not in ".!?」”’\"]`}")
-
-    @staticmethod
-    def _looks_incomplete_json(s: str) -> bool:
-        try:
-            json.loads(s)
-            return False
-        except Exception:
-            return s.count("{") != s.count("}")
-
-    # Auto-continuation loop
     def _continue_until_done(
         self,
-        first_text: str,
-        first_finish_reason: Optional[str],
-        make_parts_for_continue,  # callable(prev_tail: str) -> List[Any]
+        out: str,
+        finish_reason: Optional[str],
+        make_parts_for_continue,
         *,
-        want_json: bool = False,
-        max_continues: int = 4,
+        want_json: bool,
+        max_continues: int,
     ) -> str:
-        out = first_text or ""
-        if want_json:
-            need_more = (
-                (first_finish_reason == "MAX_TOKENS") or self._looks_incomplete_json(out)
-            )
-        else:
-            need_more = (
-                (first_finish_reason == "MAX_TOKENS") or self._looks_incomplete_text(out)
-            )
+        """Iteratively call the API until the output appears complete."""
+        need_more = (
+            (finish_reason == "MAX_TOKENS")
+            or (self._looks_incomplete_json(out) if want_json else self._looks_incomplete_text(out))
+        )
         rounds = 0
         while need_more and rounds < max_continues:
             rounds += 1
@@ -271,10 +217,14 @@ class GeminiVLM:
         *,
         lang: str = "English",
         max_words: int = 120,
+        system_rules: str = DEFAULT_SYSTEM_RULES,
     ) -> str:
-        """Generate a concise plain-text description; auto-continues if truncated."""
-        instruction = _SYSTEM_RULES + "\n" + _TASK_TEMPLATE.format(
-            task=prompt, lang=lang, fmt="Plain text", max_words=max_words
+        """Generate a concise plain-text description; auto-continues if truncated.
+
+        The instruction string is built via prompts.py and can be customized centrally.
+        """
+        instruction = build_text_instruction(
+            task=prompt, lang=lang, max_words=max_words, system_rules=system_rules
         )
         last_exc: Optional[Exception] = None
         for attempt in range(self.cfg.retry_max):
@@ -288,13 +238,8 @@ class GeminiVLM:
                 def make_parts_for_continue(tail: str) -> List[Any]:
                     return [
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        (
-                            f"{instruction}\n\n"
-                            "Continue EXACTLY from where you stopped. Do not repeat earlier text. "
-                            "Continue from this tail:\n<<<\n" + tail + "\n>>>"
-                        ),
+                        continue_text_instruction(base_instruction=instruction, tail=tail),
                     ]
-
                 full = self._continue_until_done(
                     text, finish, make_parts_for_continue, want_json=False, max_continues=4
                 )
@@ -318,26 +263,20 @@ class GeminiVLM:
         examples: Optional[List[Dict[str, Any]]] = None,
         strict_json: bool = True,
         max_words_hint: int = 200,
+        system_rules: str = DEFAULT_SYSTEM_RULES,
     ) -> Dict[str, Any]:
-        """Ask for JSON output; validate & auto-repair. Auto-continues when truncated."""
+        """Ask for JSON output; validate & auto-repair. Auto-continues when truncated.
+
+        The instruction string is built via prompts.py and can be customized centrally.
+        """
         want_schema = (schema_model is not None) and HAS_PYDANTIC
-        json_rule = (
-            "Return ONLY valid JSON. Do not include backticks, code fences, or extra text."
-            if strict_json
-            else "Return JSON first; any comments after the JSON will be ignored."
-        )
-        example_block = ""
-        if examples:
-            try:
-                example_block = "\nEXAMPLE JSON:\n" + json.dumps(examples[0], ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        base_instruction = (
-            _SYSTEM_RULES
-            + "\n"
-            + _TASK_TEMPLATE.format(task=prompt, lang=lang, fmt="JSON", max_words=max_words_hint)
-            + f"\n{json_rule}"
-            + example_block
+        base_instruction = build_json_instruction(
+            task=prompt,
+            lang=lang,
+            max_words=max_words_hint,
+            strict_json=strict_json,
+            examples=examples,
+            system_rules=system_rules,
         )
         last_exc: Optional[Exception] = None
         for attempt in range(self.cfg.retry_max):
@@ -351,15 +290,7 @@ class GeminiVLM:
                 def make_parts_for_continue(tail: str) -> List[Any]:
                     return [
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        (
-                            base_instruction
-                            + "\nContinue the SAME JSON object EXACTLY from where you stopped "
-                              "(do not repeat earlier keys/values). "
-                              "Append only the missing part so that the final result is valid JSON.\n"
-                              "Tail context:\n<<<\n"
-                            + tail
-                            + "\n>>>"
-                        ),
+                        continue_json_instruction(base_instruction=base_instruction, tail=tail),
                     ]
                 txt = self._continue_until_done(
                     txt, finish, make_parts_for_continue, want_json=True, max_continues=5
@@ -383,23 +314,13 @@ class GeminiVLM:
                 return data
             except Exception as e:
                 last_exc = e
-                # Only enrich instruction if we'll retry
                 if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
+                    # Add a hint to the instruction for the next round
                     base_instruction += f"\nVALIDATION ERROR:\n{e}\nFix and output ONLY valid JSON."
                     time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
                     continue
                 break
-        # Last resort: surface raw error
         return {"_raw": "", "_error": str(last_exc) if last_exc else "unknown"}
 
 
-if __name__ == "__main__":  # pragma: no cover
-    # Minimal smoke test (requires GOOGLE_API_KEY and a valid JPEG bytes)
-    import sys
-    print("vlm.py loaded; instantiate GeminiVLM() and call describe()/describe_json().")
-    if len(sys.argv) == 2 and os.path.isfile(sys.argv[1]):
-        with open(sys.argv[1], "rb") as f:
-            img = f.read()
-        vlm = GeminiVLM()
-        prompt = default_prompt()
-        print(vlm.describe(img, prompt, lang="Indonesian"))
+__all__ = ["VLMConfig", "GeminiVLM"]
