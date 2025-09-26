@@ -2,19 +2,15 @@
 
 Flow:
 1) Pre-check in Qdrant to avoid duplicate work.
-   - Primary: retrieve by a deterministic marker UUID derived from collection
-     and filename (sans extension). This keeps IDs valid for Qdrant.
-   - Fallback: scroll by payload (filename + type="job_marker") after
+   - Primary: retrieve by deterministic marker UUID (collection + filename sans ext).
+   - Fallback: scroll by payload (metadata.filename [+ metadata.type='job_marker']) after
      ensuring keyword payload indexes (idempotent).
 
 2) If already exists:
-   - Default exists_mode=conflict -> 409 with JSON detail
-   - exists_mode=ok              -> 200 with full JSON
-   - exists_mode=skip            -> 200 with compact JSON
+   - conflict|ok|skip behavior
 
 3) If not exists:
-   - Default: ASYNC (202 Accepted) and run ingestion in background.
-   - If async_mode is explicitly disabled (0), run sync and return 200.
+   - Default async background ingestion; optional sync if async_mode=0.
 """
 
 from __future__ import annotations
@@ -48,17 +44,22 @@ app = FastAPI(title="Document Ingestion API (default async)")
 # ---------------------------
 
 def _marker_id_for_filename(collection: str, filename_no_ext: str) -> str:
-    """
-    Deterministic UUIDv5 marker id based on collection + filename (sans extension).
-    Qdrant requires point IDs to be uint64 or UUID — this guarantees validity.
-    """
+    """Deterministic UUIDv5 marker id based on collection + filename (sans extension)."""
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{collection}:{filename_no_ext.lower()}"))
 
 
 def _idempotent_create_indexes(client, collection: str, fields: Iterable[str]) -> None:
     """
     Create keyword payload indexes for given fields (safe to call repeatedly).
-    Prevents 'Index required' errors when using payload filters on cloud clusters.
+
+    Matches your payload_schema:
+      - content
+      - metadata.category
+      - metadata.filename
+      - metadata.chunk_index
+      - metadata.dim
+
+    Plus 'metadata.type' (tiny extra) to keep job_marker filter fast/stable.
     """
     for field in fields:
         try:
@@ -137,13 +138,25 @@ async def process_endpoint(
     # ---------- Pre-check (2): fallback scroll by payload filter ----------
     if not pts:
         try:
-            _idempotent_create_indexes(client, collection, fields=("filename", "type"))
+            # Ensure indexes match your payload_schema (plus metadata.type for markers)
+            _idempotent_create_indexes(
+                client,
+                collection,
+                fields=(
+                    "content",
+                    "metadata.category",
+                    "metadata.filename",
+                    "metadata.chunk_index",
+                    "metadata.dim",
+                    "metadata.type",  # for job_marker filter
+                ),
+            )
             records, _ = client.scroll(
                 collection_name=collection,
                 scroll_filter={
                     "must": [
-                        {"key": "filename", "match": {"value": filename_no_ext}},
-                        {"key": "type", "match": {"value": "job_marker"}},
+                        {"key": "metadata.filename", "match": {"value": filename_no_ext}},
+                        {"key": "metadata.type", "match": {"value": "job_marker"}},
                     ]
                 },
                 limit=1,
