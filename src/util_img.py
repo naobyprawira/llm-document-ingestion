@@ -63,12 +63,6 @@ def to_jpeg_bytes(img) -> bytes:
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     buf = BytesIO()
     img.save(buf, "JPEG", quality=IMG_JPEG_QUALITY, optimize=True)
-    # Save a copy to the package's temp folder for debugging/inspection
-    temp_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_path = os.path.join(temp_dir, f"image_{hash(buf.getvalue())}.jpg")
-    with open(temp_path, "wb") as f:
-        f.write(buf.getvalue())
     return buf.getvalue()
 
 

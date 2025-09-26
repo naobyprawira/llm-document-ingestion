@@ -2,18 +2,17 @@
 
 This module encapsulates interactions with a Qdrant instance: creating
 clients, ensuring collections exist and constructing ``job_marker`` points
-for tracking ingestion jobs.  Keeping these details in one place makes it
-easier to swap out the vector store or adjust payload schemas in the
-future.
+for tracking ingestion jobs. Keeping these details in one place makes it
+easier to swap out the vector store or adjust payload schemas in the future.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
+import re
 import uuid
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional
 
 try:
     from qdrant_client import QdrantClient  # type: ignore
@@ -28,6 +27,10 @@ except Exception:
     _HAS_QDRANT = False
 
 
+# ---------------------------
+# Client & collection helpers
+# ---------------------------
+
 def qdrant_client() -> QdrantClient:
     """Create and return a Qdrant client using environment variables.
 
@@ -40,14 +43,8 @@ def qdrant_client() -> QdrantClient:
 
 
 def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -> None:
-    """Ensure that a collection with the given name and vector size exists.
-
-    Uses ``collection_exists`` when available; otherwise attempts to call
-    ``get_collection`` and creates the collection on failure.  See the
-    upstream implementation for details.
-    """
+    """Ensure that a collection with the given name and vector size exists."""
     try:
-        # Preferred API (available in newer qdrant-client versions)
         if hasattr(client, "collection_exists") and client.collection_exists(collection):
             return
     except Exception:
@@ -63,10 +60,48 @@ def ensure_collection(client: QdrantClient, collection: str, vector_size: int) -
     )
 
 
+# ---------------------------
+# Safety guard for IDs (optional but useful during debugging)
+# ---------------------------
+
+UUID_RE = re.compile(
+    r"^(?:[0-9a-fA-F]{32}|"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|"
+    r"urn:uuid:[0-9a-fA-F-]{36})$"
+)
+
+def _is_valid_point_id(pid: Any) -> bool:
+    if isinstance(pid, int):
+        return pid >= 0
+    if isinstance(pid, str):
+        return bool(UUID_RE.match(pid))
+    return False
+
+def safe_upsert(client: QdrantClient, *, collection_name: str, points: Iterable, wait: bool = True):
+    """Validate point IDs before upsert to catch bad IDs early."""
+    pts_list = list(points)
+    for p in pts_list:
+        pid = getattr(p, "id", None)
+        if pid is None and isinstance(p, dict):
+            pid = p.get("id")
+        if not _is_valid_point_id(pid):
+            print(f"[FATAL] Invalid point id about to be upserted: {pid!r}")
+            raise ValueError(f"Invalid Qdrant point id: {pid!r}")
+    return client.upsert(collection_name=collection_name, points=pts_list, wait=wait)
+
+
+# ---------------------------
+# Marker helpers
+# ---------------------------
+
+def marker_id_for_filename(collection: str, filename_no_ext: str) -> str:
+    """Stable UUIDv5 for a given collection + filename base (valid Qdrant id)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{collection}:{filename_no_ext.lower()}"))
+
 def marker_point(
     job_key: str,
     vector: List[float],
-    filename: str,
+    filename: str,          # may include extension
     category: str,
     collection: str,
     status: str,
@@ -76,16 +111,15 @@ def marker_point(
 ) -> PointStruct:
     """Construct a ``job_marker`` point for tracking pipeline progress.
 
-    The returned point has a deterministic ID of the form ``marker-<job_key>``
-    and includes information about the current status, number of expected
-    chunks, number uploaded so far and any error message.  When ``status``
-    is either ``done`` or ``failed``, the payload will include a
-    ``finished_at`` ISO timestamp.
+    The point *ID* is a UUIDv5 derived from ``collection + filename_without_ext``,
+    which satisfies Qdrant's ID constraints (uint64 or UUID) and remains stable.
+    The human-friendly filename (sans extension) is stored in payload["filename"].
     """
+    base = os.path.splitext(filename)[0]  # ensure no extension
     payload: Dict[str, Any] = {
         "type": "job_marker",
         "job_key": job_key,
-        "filename": filename,
+        "filename": base,
         "category": category,
         "collection": collection,
         "status": status,
@@ -97,12 +131,15 @@ def marker_point(
         payload["finished_at"] = datetime.now().isoformat()
     if error:
         payload["error"] = str(error)
-    return PointStruct(id=job_key, vector=vector, payload=payload)
 
+    point_id = marker_id_for_filename(collection, base)  # <-- VALID UUID
+    return PointStruct(id=point_id, vector=vector, payload=payload)
 
 
 __all__ = [
     "qdrant_client",
     "ensure_collection",
+    "marker_id_for_filename",
     "marker_point",
+    "safe_upsert",
 ]

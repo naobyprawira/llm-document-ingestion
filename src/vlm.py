@@ -60,7 +60,7 @@ except Exception:
 @dataclass
 class VLMConfig:
     """Configuration for :class:`GeminiVLM`.  Values are loaded from environment vars."""
-    api_key: str = os.getenv("GOOGLE_API_KEY", "")
+    api_key: str = os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
     model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     max_tokens: int = int(os.getenv("VLM_MAX_TOKENS", "1512"))
     temperature: float = float(os.getenv("VLM_TEMPERATURE", "0.2"))
@@ -106,7 +106,7 @@ class GeminiVLM:
         self.cfg = cfg or VLMConfig()
         if _HAS_GOOGLE:
             if not self.cfg.api_key:
-                raise ValueError("GOOGLE_API_KEY is missing")
+                raise ValueError("GOOGLE_API_KEY (or GEMINI_API_KEY) is missing")
             # Optional client-level timeout via HttpOptions
             if self.cfg.timeout_ms:
                 http_opts = types.HttpOptions(timeout=self.cfg.timeout_ms)
@@ -127,12 +127,14 @@ class GeminiVLM:
     ) -> tuple[str, Optional[str]]:
         """Perform a single generation call, returning text and finish_reason.
 
-        In stub mode (when the Google SDK is missing) this returns a
-        dummy description and ``None`` for the finish reason.
+        Uses the current google-genai surface:
+          - client.models.generate_content(...)
+          - client.models.generate_content_stream(...)
         """
         if not _HAS_GOOGLE:
             # Return a generic message; the actual content of ``parts`` is ignored
             return "[vision service unavailable]", None
+
         gen_cfg = types.GenerateContentConfig(
             temperature=self.cfg.temperature,
             max_output_tokens=self.cfg.max_tokens,
@@ -143,22 +145,15 @@ class GeminiVLM:
         )
         if response_mime_type:
             try:
-                gen_cfg.response_mime_type = response_mime_type  # type: ignore[attr-defined]
+                gen_cfg.response_mime_type = response_mime_type  # e.g. "application/json"
             except Exception:
                 pass
-        if stream:
-            resp = self.client.text.partials_generate(
-                model=self.cfg.model, content=parts, generation_config=gen_cfg
-            )
-            out = ""
-            finish = None
-            for partial in resp:
-                out += partial.text or ""
-                finish = getattr(partial, "finish_reason", None) or getattr(partial, "finishReason", None)
-            return out, finish
-        else:
-            resp = self.client.text.generate(
-                model=self.cfg.model, content=parts, generation_config=gen_cfg
+
+        if not stream:
+            resp = self.client.models.generate_content(
+                model=self.cfg.model,
+                contents=parts,
+                config=gen_cfg,
             )
             text = (getattr(resp, "text", "") or "").strip()
             fr = None
@@ -168,6 +163,26 @@ class GeminiVLM:
             except Exception:
                 pass
             return text, fr
+
+        # Streaming
+        out = ""
+        finish = None
+        stream_it = self.client.models.generate_content_stream(
+            model=self.cfg.model,
+            contents=parts,
+            config=gen_cfg,
+        )
+        for event in stream_it:
+            t = getattr(event, "text", None)
+            if t:
+                out += t
+            try:
+                cand0 = event.candidates[0] if getattr(event, "candidates", None) else None
+                fr = getattr(cand0, "finish_reason", None) or getattr(cand0, "finishReason", None)
+                finish = finish or fr
+            except Exception:
+                pass
+        return out, finish
 
     def _looks_incomplete_text(self, text: str) -> bool:
         """Heuristic: check if a text response looks incomplete."""

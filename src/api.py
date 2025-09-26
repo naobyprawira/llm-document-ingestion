@@ -1,509 +1,231 @@
-# src/api.py
-"""
-FastAPI application exposing a single /process endpoint that supports:
-- Synchronous mode (default): parse -> chunk -> embed, then respond with 200.
-- Asynchronous mode (async=1): immediately 202 Accepted with job_key; heavy work continues
-  in background using BackgroundTasks. Progress & completion are recorded as a "job_marker"
-  point in Qdrant (payload-filterable), so clients can poll Qdrant without new endpoints.
+"""FastAPI application exposing a single `/process` endpoint.
 
-Env (examples):
-- MAX_CONCURRENT_PARSE: int, limit concurrent parse stages (default: 3)
-- MAX_CONCURRENT_VLM:   int, limit concurrent VLM describe() calls (default: 5)
-- EMBED_BATCH_SIZE:     int, number of chunks per Qdrant upsert batch (default: 64)
-- QDRANT_URL, QDRANT_API_KEY, QDRANT_COLLECTION: Qdrant connection/config
-- LOG_LEVEL:            DEBUG|INFO|WARNING|ERROR (default: INFO)
+Flow:
+1) Pre-check in Qdrant to avoid duplicate work.
+   - Primary: retrieve by a deterministic marker UUID derived from collection
+     and filename (sans extension). This keeps IDs valid for Qdrant.
+   - Fallback: scroll by payload (filename + type="job_marker") after
+     ensuring keyword payload indexes (idempotent).
+
+2) If already exists:
+   - Default exists_mode=conflict -> 409 with JSON detail
+   - exists_mode=ok              -> 200 with full JSON
+   - exists_mode=skip            -> 200 with compact JSON
+
+3) If not exists:
+   - Default: ASYNC (202 Accepted) and run ingestion in background.
+   - If async_mode is explicitly disabled (0), run sync and return 200.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import time
 import uuid
-import logging
-import warnings
-from datetime import datetime
-from tempfile import NamedTemporaryFile
-from typing import List, Dict, Any, Optional, Iterable
+from typing import Optional, Iterable
 
-import anyio
-import asyncio
-from dotenv import load_dotenv
-
-load_dotenv()
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks  # type: ignore
-from fastapi.responses import JSONResponse  # type: ignore
-from pydantic import BaseModel  # type: ignore
-
-from .doc_parser import DocParser, Figure
-from .vlm import GeminiVLM, VLMConfig
-from .prompts import default_prompt
-from .markdown import FigureDesc, compose_markdown
-from .chunk import chunk_markdown
-from .embed import get_genai_embedding  # low-level embed for batching
-
-
-
-# Silence torch CPU-only pin_memory warning (harmless when no accelerator)
-warnings.filterwarnings(
-    "ignore",
-    message=r".*'pin_memory' argument is set as true but no accelerator is found.*",
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
 )
+from fastapi.responses import JSONResponse
 
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-_base_logger = logging.getLogger("ingestion")
-if not _base_logger.handlers:
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s job=%(job)s file=%(file)s phase=%(phase)s msg=%(message)s"
-    )
-    _handler.setFormatter(_formatter)
-    _base_logger.addHandler(_handler)
-_base_logger.setLevel(_LOG_LEVEL)
+from .pipeline_sync import process_file
+from .qdrant_utils import qdrant_client
+from .logger import get_logger
 
 
-class _Adapter(logging.LoggerAdapter):
-    """Injects job/file/phase keys so our formatter never KeyErrors."""
-    def __init__(self, logger, job="-", file="-", phase="-"):
-        super().__init__(logger, {"job": job, "file": file, "phase": phase})
-
-    def with_phase(self, phase: str) -> "_Adapter":
-        return _Adapter(self.logger, self.extra.get("job", "-"), self.extra.get("file", "-"), phase)
+app = FastAPI(title="Document Ingestion API (default async)")
 
 
-def _logger(job: str = "-", file: str = "-", phase: str = "-") -> _Adapter:
-    return _Adapter(_base_logger, job, file, phase)
-# -------------------------------------------------------------------------
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def _marker_id_for_filename(collection: str, filename_no_ext: str) -> str:
+    """
+    Deterministic UUIDv5 marker id based on collection + filename (sans extension).
+    Qdrant requires point IDs to be uint64 or UUID — this guarantees validity.
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{collection}:{filename_no_ext.lower()}"))
 
 
-# ====================== Concurrency controls ======================
-MAX_CONCURRENT_PARSE = int(os.getenv("MAX_CONCURRENT_PARSE", "3"))
-MAX_CONCURRENT_VLM   = int(os.getenv("MAX_CONCURRENT_VLM", "5"))
-EMBED_BATCH_SIZE     = int(os.getenv("EMBED_BATCH_SIZE", "64"))
-
-_PARSE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_PARSE)
-_VLM_SEMAPHORE   = asyncio.Semaphore(MAX_CONCURRENT_VLM)
-# ==================================================================
-
-
-def _ensure_primitive(value: Any) -> Any:
-    """Coerce to JSON-serializable primitive."""
-    if callable(value):
+def _idempotent_create_indexes(client, collection: str, fields: Iterable[str]) -> None:
+    """
+    Create keyword payload indexes for given fields (safe to call repeatedly).
+    Prevents 'Index required' errors when using payload filters on cloud clusters.
+    """
+    for field in fields:
         try:
-            value = value()
+            client.create_payload_index(
+                collection_name=collection,
+                field_name=field,
+                field_schema="keyword",
+                wait=True,
+            )
         except Exception:
-            return str(value)
-    if isinstance(value, dict):
-        return {k: _ensure_primitive(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_ensure_primitive(v) for v in value]
-    try:
-        json.dumps(value)
-        return value
-    except TypeError:
-        return str(value)
-
-
-def _extract_metadata_from_doc(doc: Any) -> Dict[str, Any]:
-    """Extract common metadata from Docling document if present."""
-    author: Optional[str] = None
-    page_count: Optional[int] = None
-    try:
-        if hasattr(doc, "info"):
-            info = getattr(doc, "info")
-            if hasattr(info, "authors"):
-                try:
-                    authors_val = getattr(info, "authors")
-                    authors = _ensure_primitive(authors_val)
-                    if authors:
-                        if isinstance(authors, (list, tuple, set)):
-                            author = ", ".join([str(a) for a in authors])
-                        else:
-                            author = str(authors)
-                except Exception:
-                    pass
-            if author is None and hasattr(info, "author"):
-                try:
-                    val = getattr(info, "author")
-                    primitive = _ensure_primitive(val)
-                    if primitive:
-                        author = str(primitive)
-                except Exception:
-                    pass
-        for attr in ["page_count", "n_pages", "num_pages"]:
-            if page_count is not None:
-                break
-            if hasattr(doc, attr):
-                try:
-                    val = getattr(doc, attr)
-                    primitive = _ensure_primitive(val)
-                    if primitive is not None:
-                        try:
-                            page_count = int(primitive)  # type: ignore[assignment]
-                        except Exception:
-                            page_count = None
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return {"author": author, "page_count": page_count}
-
-
-async def _parse_document(
-    tmp_path: str,
-    filename: str,
-    ext: str,
-    image_bytes: bytes | None = None,
-    *,
-    job_key: str,
-) -> tuple[str, Dict[str, Any]]:
-    """Parse a document or image and return (markdown, metadata)."""
-    log = _logger(job=job_key, file=filename, phase="parse")
-    t0 = time.perf_counter()
-
-    metadata: Dict[str, Any] = {"filename": filename, "file_type": ext.lstrip(".")}
-    markdown: str = ""
-
-    # Try to hint VLM to disable AFC if supported by your wrapper's config
-    cfg = VLMConfig()
-    if hasattr(cfg, "disable_afc"):
-        try:
-            setattr(cfg, "disable_afc", True)
-        except Exception:
+            # ignore "already exists" or transient errors
             pass
 
-    if ext == ".pdf":
-        log.info("start: docling.parse")
-        parser = DocParser()
-        # anyio.to_thread.run_sync is the recommended pattern for sync work in async apps
-        doc, base_md, figures = await anyio.to_thread.run_sync(parser.parse, tmp_path)
-        meta_extra = _extract_metadata_from_doc(doc)
-        metadata.update(meta_extra)
 
-        valid_figures = [f for f in figures if len(f.jpeg_bytes) >= 5000]
-        metadata["images_count"] = len(valid_figures)
-
-        vlm = GeminiVLM(cfg)
-        prompt = default_prompt()
-
-        async def describe_one(f: Figure) -> FigureDesc:
-            async with _VLM_SEMAPHORE:
-                # ONE call only – no local retries based on caption length.
-                text = await anyio.to_thread.run_sync(lambda: vlm.describe(f.jpeg_bytes, prompt))
-                log.info(f"vlm.describe: figure {f.index} completed, text_length={len(text or '')}")
-                return FigureDesc(index=f.index, page=f.page, caption=f.caption, description=text or "")
-
-        if valid_figures:
-            log.info(f"vlm.describe: start, figures={len(valid_figures)} (throttled={MAX_CONCURRENT_VLM})")
-            descs: List[FigureDesc] = await asyncio.gather(*(describe_one(f) for f in valid_figures))
-        else:
-            descs = []
-        markdown = compose_markdown(base_md, descs)
-        log.info(f"done: docling+vlm in {time.perf_counter()-t0:.3f}s pages={metadata.get('page_count')} images={metadata.get('images_count')}")
-    else:
-        log.info("start: image.describe")
-        metadata.update({"page_count": 1, "images_count": 1, "author": None})
-        data = image_bytes if image_bytes is not None else open(tmp_path, "rb").read()
-        vlm = GeminiVLM(cfg)
-        prompt = default_prompt()
-        async with _VLM_SEMAPHORE:
-            text = await anyio.to_thread.run_sync(lambda: vlm.describe(data, prompt))
-        markdown = f"![{filename}]({filename})\n\n{(text or '').strip() or '[No description]'}"
-        log.info(f"done: image.describe in {time.perf_counter()-t0:.3f}s")
-
-    return markdown, metadata
-
-
-def _batched(seq: List[Any], size: int) -> Iterable[List[Any]]:
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-# ---- Qdrant client (per current quickstart examples) ----
-try:
-    from qdrant_client import QdrantClient  # type: ignore
-    from qdrant_client.http.models import VectorParams, Distance, PointStruct  # docs show http.models in quickstart
-    _HAS_QDRANT = True
-except Exception:
-    _HAS_QDRANT = False
-
-
-def _qdrant_client() -> QdrantClient:
-    url = os.environ.get("QDRANT_URL")
-    if not url:
-        raise RuntimeError("QDRANT_URL environment variable is not set.")
-    return QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY"))
-
-
-def _ensure_collection(client: QdrantClient, collection: str, vector_size: int) -> None:
-    # Prefer collection_exists() per client docs
-    if not client.collection_exists(collection):
-        client.create_collection(
-            collection_name=collection,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
-
-
-def _marker_point(job_key: str,
-                  vector: List[float],
-                  filename: str,
-                  category: str,
-                  collection: str,
-                  status: str,
-                  expected_chunks: Optional[int],
-                  uploaded_chunks: int,
-                  error: Optional[str] = None) -> PointStruct:
-    payload = {
-        "type": "job_marker",
-        "job_key": job_key,
-        "filename": filename,
-        "category": category,
-        "collection": collection,
-        "status": status,  # "running" | "done" | "failed"
-        "expected_chunks": expected_chunks,
-        "uploaded_chunks": uploaded_chunks,
-        "finished_at": None,
-    }
-    if status in ("done", "failed"):
-        payload["finished_at"] = datetime.now().isoformat()
-    if error:
-        payload["error"] = str(error)
-    return PointStruct(id=f"marker-{job_key}", vector=vector, payload=payload)
-
-
-def _embed_texts_get_vectors(texts: List[str]) -> List[List[float]]:
-    """Synchronous helper to embed a batch of texts."""
-    return [get_genai_embedding(t) for t in texts]
-
-
-async def _process_job_async(
+def _run_ingestion_bg(
+    *,
     data: bytes,
     filename: str,
     ext: str,
     category: str,
-    collection_name: str,
+    collection: str,
     job_key: str,
 ) -> None:
-    """
-    Background pipeline:
-    parse (gated) -> chunk -> embed (batched) -> job_marker updates.
-    Runs after 202 Accepted has been sent to the client.
-    """
-    log = _logger(job=job_key, file=filename, phase="background")
-    client: Optional[QdrantClient] = None
-    marker_vec: Optional[List[float]] = None
-    uploaded = 0
-    expected: Optional[int] = None
-    t_overall = time.perf_counter()
-
+    """Background ingestion runner; logs failures instead of raising."""
+    log = get_logger(job=job_key, file=filename, phase="bg")
     try:
-        # -------- PARSE (gated) --------
-        t0 = time.perf_counter()
-        async with _PARSE_SEMAPHORE:
-            if ext == ".pdf":
-                with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(data)
-                    tmp_path = tmp.name
-                try:
-                    markdown, metadata = await _parse_document(tmp_path, filename, ext, job_key=job_key)
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-            else:
-                markdown, metadata = await _parse_document("", filename, ext, image_bytes=data, job_key=job_key)
-        log.with_phase("parse").info(f"completed in {time.perf_counter() - t0:.3f}s")
-
-        # -------- CHUNK (offloaded) --------
-        t1 = time.perf_counter()
-        chunks: List[str] = await anyio.to_thread.run_sync(chunk_markdown, markdown)
-        expected = len(chunks)
-        log.with_phase("chunk").info(f"completed count={expected} in {time.perf_counter()-t1:.3f}s")
-
-        if not _HAS_QDRANT or not chunks:
-            log.with_phase("embed").warning("skipped (no Qdrant or no chunks)")
-            return
-
-        # Prepare Qdrant client and marker vector (ensure collection)
-        client = _qdrant_client()
-        marker_vec = get_genai_embedding("job_marker")
-        _ensure_collection(client, collection_name, len(marker_vec))
-
-        # Upsert initial marker as "running"
-        client.upsert(
-            collection_name=collection_name,
-            points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "running", expected, uploaded)],
-            wait=True,
+        process_file(
+            data=data,
+            filename=filename,
+            ext=ext,
+            category=category,
+            collection=collection,
+            job_key=job_key,
         )
-        log.with_phase("embed").info(f"start: total_chunks={expected} batch_size={EMBED_BATCH_SIZE}")
-
-        # -------- EMBED & UPSERT IN BATCHES --------
-        chunk_index_offset = 0
-        for batch in _batched(chunks, EMBED_BATCH_SIZE):
-            tb = time.perf_counter()
-            vectors = await anyio.to_thread.run_sync(_embed_texts_get_vectors, batch)
-
-            # Build Qdrant points for this batch
-            points: List[PointStruct] = []
-            for i, (text, vec) in enumerate(zip(batch, vectors)):
-                idx = chunk_index_offset + i
-                payload = {"filename": filename, "category": category, "chunk_index": idx, "dim": len(vec)}
-                points.append(PointStruct(id=uuid.uuid4().hex, vector=vec, payload=payload))
-
-            client.upsert(collection_name=collection_name, points=points, wait=True)
-            uploaded += len(points)
-
-            # Update progress marker
-            client.upsert(
-                collection_name=collection_name,
-                points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "running", expected, uploaded)],
-                wait=True,
-            )
-            log.with_phase("embed").info(f"batch uploaded={len(points)} total_uploaded={uploaded} took={time.perf_counter()-tb:.3f}s")
-            chunk_index_offset += len(batch)
-
-        # Mark as done
-        client.upsert(
-            collection_name=collection_name,
-            points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "done", expected, uploaded)],
-            wait=True,
-        )
-        log.with_phase("embed").info(f"completed total_uploaded={uploaded} overall={time.perf_counter()-t_overall:.3f}s")
-
+        log.info("background ingestion completed")
     except Exception as e:
-        if client and marker_vec:
-            try:
-                client.upsert(
-                    collection_name=collection_name,
-                    points=[_marker_point(job_key, marker_vec, filename, category, collection_name, "failed", expected, uploaded, error=str(e))],
-                    wait=True,
-                )
-            except Exception:
-                pass
-        _logger(job=job_key, file=filename, phase="error").exception(f"pipeline failed: {e}")
+        log.error(f"background ingestion failed: {e}")
 
 
-# ----------------------------- FastAPI app -----------------------------
-app = FastAPI(title="Document Ingestion API")
-
-
-class _ProcessResponse(BaseModel):
-    # For 202 response
-    status: str
-    job_key: str
-    filename: str
-    category: str
-    collection: str
-
+# ---------------------------
+# FastAPI routes
+# ---------------------------
 
 @app.post("/process")
 async def process_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     category: str = Form(...),
-    async_mode: Optional[str] = Form(default=None),
+    collection: str = Form(...),
+    job_key: Optional[str] = Form(None),
+    # How to signal "already exists": conflict|ok|skip (default = conflict)
+    exists_mode: str = Query("conflict", pattern="^(ok|conflict|skip)$"),
+    # Single optional async toggle (default async=1)
+    async_mode: int = Query(1, ge=0, le=1),
 ):
-    """
-    Mode A (default): Full pipeline and respond when completed (HTTP 200).
-    Mode B (async=1): Respond immediately (HTTP 202) & run pipeline in background.
-    """
     filename = file.filename or f"upload_{uuid.uuid4().hex}"
     ext = os.path.splitext(filename)[1].lower()
-    collection_name = os.getenv("QDRANT_COLLECTION", "documents")
+    filename_no_ext = os.path.splitext(filename)[0]
 
-    # Read bytes NOW (UploadFile temp may be deleted after response)
+    client = qdrant_client()
+
+    # Deterministic, valid Qdrant point ID (UUIDv5) for the marker
+    marker_id = _marker_id_for_filename(collection, filename_no_ext)
+
+    # ---------- Pre-check (1): retrieve by UUID marker id (O(1)) ----------
+    try:
+        pts = client.retrieve(
+            collection_name=collection,
+            ids=[marker_id],
+            with_payload=False,
+            with_vectors=False,
+        )
+    except Exception:
+        pts = []
+
+    # ---------- Pre-check (2): fallback scroll by payload filter ----------
+    if not pts:
+        try:
+            _idempotent_create_indexes(client, collection, fields=("filename", "type"))
+            records, _ = client.scroll(
+                collection_name=collection,
+                scroll_filter={
+                    "must": [
+                        {"key": "filename", "match": {"value": filename_no_ext}},
+                        {"key": "type", "match": {"value": "job_marker"}},
+                    ]
+                },
+                limit=1,
+                with_payload=False,
+                with_vectors=False,
+            )
+        except Exception:
+            records = []
+    else:
+        records = pts
+
+    if records:  # already ingested -> signal based on exists_mode
+        payload = {
+            "status": "exists",
+            "action": "conflict" if exists_mode == "conflict" else "skip",
+            "file_name": filename_no_ext,
+            "collection": collection,
+            "reason": "document_with_same_filename_already_indexed",
+            "marker_id": marker_id,
+            "category": category,
+            "job_key": job_key,
+        }
+        if exists_mode == "conflict":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=payload)
+        elif exists_mode == "skip":
+            return JSONResponse({"status": "exists", "action": "skip", "file_name": filename_no_ext}, status_code=200)
+        else:  # ok
+            return JSONResponse(payload, status_code=200)
+
+    # ---------- Not found: proceed ----------
+    is_async = (async_mode == 1)
+
     data = await file.read()
-
-    is_async = str(async_mode).strip().lower() in {"1", "true", "yes"}
+    job_key_final = job_key or uuid.uuid4().hex
 
     if is_async:
-        # ---------- Mode B: fire-and-poll ----------
-        job_key = uuid.uuid4().hex
-        _logger(job=job_key, file=filename, phase="accept").info("accepted async job")
-        # FastAPI BackgroundTasks: runs after the response has been sent
         background_tasks.add_task(
-            _process_job_async,
-            data,
-            filename,
-            ext,
-            category,
-            collection_name,
-            job_key,
+            _run_ingestion_bg,
+            data=data,
+            filename=filename,
+            ext=ext,
+            category=category,
+            collection=collection,
+            job_key=job_key_final,
         )
         return JSONResponse(
-            status_code=202,
-            content=_ProcessResponse(
-                status="accepted",
-                job_key=job_key,
-                filename=filename,
-                category=category,
-                collection=collection_name,
-            ).model_dump(),  # Pydantic v2
+            {
+                "status": "accepted",
+                "async_mode": 1,
+                "file_name": filename_no_ext,
+                "collection": collection,
+                "category": category,
+                "job_key": job_key_final,
+            },
+            status_code=status.HTTP_202_ACCEPTED,
         )
 
-    # ---------- Mode A: synchronous pipeline ----------
-    job_key = uuid.uuid4().hex
-    log = _logger(job=job_key, file=filename, phase="sync")
-    t_overall = time.perf_counter()
-    try:
-        # PARSE (gated by semaphore)
-        t0 = time.perf_counter()
-        async with _PARSE_SEMAPHORE:
-            if ext == ".pdf":
-                with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(data)
-                    tmp_path = tmp.name
-                try:
-                    markdown, metadata = await _parse_document(tmp_path, filename, ext, job_key=job_key)
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-            else:
-                markdown, metadata = await _parse_document("", filename, ext, image_bytes=data, job_key=job_key)
-        log.with_phase("parse").info(f"completed in {time.perf_counter()-t0:.3f}s")
+    # Sync path
+    result = process_file(
+        data=data,
+        filename=filename,
+        ext=ext,
+        category=category,
+        collection=collection,
+        job_key=job_key_final,
+    )
+    return JSONResponse(result, status_code=200)
 
-        # CHUNK (offload)
-        t1 = time.perf_counter()
-        chunks: List[str] = await anyio.to_thread.run_sync(chunk_markdown, markdown)
-        log.with_phase("chunk").info(f"completed count={len(chunks)} in {time.perf_counter()-t1:.3f}s")
 
-        # EMBED batched (offload embedding loop)
-        uploaded = 0
-        if _HAS_QDRANT and chunks:
-            client = _qdrant_client()
-            marker_vec = get_genai_embedding("marker")
-            _ensure_collection(client, collection_name, len(marker_vec))
+@app.get("/healthz")
+def healthz() -> JSONResponse:
+    """Return basic health information and configuration presence."""
+    info = {
+        "python": os.sys.version.split()[0],
+        "gemini_model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+        "embed_model": os.getenv("GENAI_EMBED_MODEL", "gemini-embedding-001"),
+        "api_key_present": bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GENAI_API_KEY")),
+        "max_concurrent_vlm": os.getenv("MAX_CONCURRENT_VLM", "5"),
+        "default_async": True,
+        "exists_mode_default": "conflict",
+    }
+    return JSONResponse(content=info)
 
-            chunk_index_offset = 0
-            for batch in _batched(chunks, EMBED_BATCH_SIZE):
-                tb = time.perf_counter()
-                vectors = await anyio.to_thread.run_sync(_embed_texts_get_vectors, batch)
-                points: List[PointStruct] = []
-                for i, (text, vec) in enumerate(zip(batch, vectors)):
-                    idx = chunk_index_offset + i
-                    payload = {"filename": filename, "category": category, "chunk_index": idx, "dim": len(vec)}
-                    points.append(PointStruct(id=uuid.uuid4().hex, vector=vec, payload=payload))
-                client.upsert(collection_name=collection_name, points=points, wait=True)
-                uploaded += len(points)
-                chunk_index_offset += len(batch)
-                log.with_phase("embed").info(f"batch uploaded={len(points)} total_uploaded={uploaded} took={time.perf_counter()-tb:.3f}s")
 
-        log.with_phase("embed").info(f"completed total_uploaded={uploaded} overall={time.perf_counter()-t_overall:.3f}s")
-        return JSONResponse({
-            "file_name": filename,
-            "file_type": metadata.get("file_type"),
-            "page_count": metadata.get("page_count"),
-            "images_count": metadata.get("images_count"),
-            "uploaded_chunks": uploaded,
-            "collection": collection_name,
-            "total_processing_seconds": time.perf_counter() - t_overall,
-            "category": category,
-        })
-    except Exception as e:
-        log.with_phase("error").exception(f"pipeline failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+__all__ = ["app"]
