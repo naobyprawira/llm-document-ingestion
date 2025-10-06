@@ -1,9 +1,9 @@
 """Synchronous document ingestion pipeline.
 
-This module orchestrates the end‑to‑end ingestion flow: parsing PDFs or
+This module orchestrates the end-to-end ingestion flow: parsing PDFs or
 images, cleaning and chunking the resulting markdown, embedding chunks
-and writing them into Qdrant.  All operations are synchronous; there
-are no ``async def`` functions or semaphores.  Concurrency is used only
+and writing them into Qdrant. All operations are synchronous; there
+are no ``async def`` functions or semaphores. Concurrency is used only
 within the parser to describe figures via Gemini (see
 ``parser_utils._describe_figures``).
 """
@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from .parser_utils import parse_document
 from .chunk import chunk_markdown
@@ -38,23 +38,11 @@ def process_file(
     collection: str,
     job_key: str,
 ) -> Dict[str, Any]:
-    """Run the synchronous ingestion pipeline over a document.
-
-    :param data: Raw bytes of the uploaded file (PDF or image).
-    :param filename: The original filename for logging.
-    :param ext: File extension (lowercase, including dot, e.g. `.pdf`).
-    :param category: Arbitrary category tag provided by the client.
-    :param collection: Name of the Qdrant collection to upsert into.
-    :param job_key: Unique identifier for this ingestion job.
-    :return: A dictionary containing metadata about the processed document and the enriched markdown.
-    """
+    """Run the synchronous ingestion pipeline over a document."""
     log = get_logger(job=job_key, file=filename, phase="process")
     t_overall = time.perf_counter()
 
-    # Determine the document identifier (basename without extension).  This
-    # value is used as the marker ID so that duplicate files can be
-    # detected prior to ingestion.  We keep the original filename with
-    # extension for logging and for returning to clients.
+    # Base identifier (filename without extension) for payload display & grouping
     doc_id = os.path.splitext(filename)[0]
 
     # -------- PARSE --------
@@ -86,11 +74,8 @@ def process_file(
     )
 
     uploaded = 0
+
     # -------- EMBED & UPSERT --------
-    # Attempt to obtain a Qdrant client.  If this fails (e.g. Qdrant is
-    # misconfigured), embedding and upserts will be skipped but the
-    # remainder of the pipeline still runs.  This ensures that
-    # ingestion cannot be completely blocked by connectivity issues.
     has_qdrant = False
     try:
         client = qdrant_client()
@@ -101,17 +86,12 @@ def process_file(
 
     marker_vec: Optional[List[float]] = None
     if has_qdrant and chunks:
-        # Prepare marker vector and ensure collection exists.  The
-        # marker vector is a dummy embedding used only to satisfy the
-        # Qdrant schema.  It is stored alongside the job marker to
-        # record ingestion progress.
+        # Prepare marker vector and ensure collection exists.
         marker_vec = get_genai_embedding("job_marker")
         ensure_collection(client, collection, len(marker_vec))
-        # Create payload indexes for filename and category so that
-        # downstream queries can efficiently filter points by these
-        # fields.  These calls are idempotent: if an index already
-        # exists Qdrant will ignore the request.
-        for field_name in ("filename", "category"):
+
+        # Create payload indexes for downstream filtering.
+        for field_name in ("filename", "category", "type"):
             try:
                 client.create_payload_index(
                     collection_name=collection,
@@ -121,22 +101,20 @@ def process_file(
                 )
             except Exception:
                 pass
-        # Upsert an initial job marker using the document ID as the
-        # point ID.  This allows the API to skip reprocessing of
-        # documents whose filename (without extension) already
-        # exists in the collection.
+
+        # Initial job marker (ID is UUIDv5 via marker_point; filename kept in payload)
         client.upsert(
             collection_name=collection,
             points=[
                 marker_point(
-                    job_key,
-                    marker_vec,
-                    doc_id,
-                    category,
-                    collection,
-                    "running",
-                    expected,
-                    uploaded,
+                    job_key=job_key,
+                    vector=marker_vec,
+                    filename=filename,   # pass original; helper strips ext
+                    category=category,
+                    collection=collection,
+                    status="running",
+                    expected_chunks=expected,
+                    uploaded_chunks=uploaded,
                 )
             ],
             wait=True,
@@ -145,50 +123,51 @@ def process_file(
             f"Started embedding: total_chunks={expected} batch_size={EMBED_BATCH_SIZE}"
         )
 
+        # Embed & upsert in small batches
         chunk_index_offset = 0
         for batch in _batched(chunks, EMBED_BATCH_SIZE):
             t_batch = time.perf_counter()
-            # Compute embeddings serially.  Note that these calls
-            # respect the configured embedding model via the default
-            # ``model_name`` parameter in ``get_genai_embedding``.
+
+            # 1) Embed (sequential)
             vectors = [get_genai_embedding(text) for text in batch]
-            # Build points for this batch.  Place 'text' and 'category'
-            # first in the payload dictionary to make it easier to
-            # visually inspect the stored objects in Qdrant’s UI.
+
+            # 2) Build points (chunk IDs are random UUIDs; filename shown in payload)
             points: List[Dict[str, Any]] = []
             for i, (text_chunk, vec) in enumerate(zip(batch, vectors)):
                 idx = chunk_index_offset + i
                 payload = {
-                    "text": text_chunk,
-                    "category": category,
+                    "text": text_chunk,         # put text at top for easy viewing
+                    "category": category,       # easy to scan
                     "filename": doc_id,
                     "chunk_index": idx,
                     "dim": len(vec),
+                    "type": "chunk",
                 }
                 points.append(
                     {
-                        "id": uuid.uuid4().hex,
+                        "id": uuid.uuid4().hex,  # valid UUID (simple form)
                         "vector": vec,
                         "payload": payload,
                     }
                 )
-            # Upsert this batch of points.  ``wait=True`` ensures that
-            # Qdrant finishes writing the points before returning.
+
+            # 3) Upsert batch
             client.upsert(collection_name=collection, points=points, wait=True)
             uploaded += len(points)
-            # Update progress marker with the number of uploaded chunks.
+
+            # 4) Update progress marker
             client.upsert(
                 collection_name=collection,
                 points=[
                     marker_point(
-                        job_key,
-                        marker_vec,
-                        doc_id,
-                        category,
-                        collection,
-                        "running",
-                        expected,
-                        uploaded,
+                        job_key=job_key,
+                        vector=marker_vec,
+                        filename=filename,
+                        category=category,
+                        collection=collection,
+                        status="running",
+                        expected_chunks=expected,
+                        uploaded_chunks=uploaded,
                     )
                 ],
                 wait=True,
@@ -197,19 +176,20 @@ def process_file(
                 f"Batch uploaded={len(points)} total_uploaded={uploaded} took={time.perf_counter() - t_batch:.3f}s"
             )
             chunk_index_offset += len(batch)
-        # Upsert final marker marking completion of the job.
+
+        # Final marker
         client.upsert(
             collection_name=collection,
             points=[
                 marker_point(
-                    job_key,
-                    marker_vec,
-                    doc_id,
-                    category,
-                    collection,
-                    "done",
-                    expected,
-                    uploaded,
+                    job_key=job_key,
+                    vector=marker_vec,
+                    filename=filename,
+                    category=category,
+                    collection=collection,
+                    status="done",
+                    expected_chunks=expected,
+                    uploaded_chunks=uploaded,
                 )
             ],
             wait=True,
@@ -223,6 +203,7 @@ def process_file(
         )
 
     total_seconds = time.perf_counter() - t_overall
+
     # Compose result
     result: Dict[str, Any] = {
         "file_name": filename,
