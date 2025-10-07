@@ -34,10 +34,13 @@ from fastapi.responses import JSONResponse
 from .pipeline_sync import process_file
 from .qdrant_utils import qdrant_client
 from .logger import get_logger
+from .bm25_endpoint import attach_bm25_endpoints
+from .retrieve import attach_retrieval_endpoints
 
 
 app = FastAPI(title="Document Ingestion API (default async)")
-
+attach_bm25_endpoints(app)
+attach_retrieval_endpoints(app)
 
 # ---------------------------
 # Helpers
@@ -143,12 +146,9 @@ async def process_endpoint(
                 client,
                 collection,
                 fields=(
-                    "content",
                     "metadata.category",
                     "metadata.filename",
-                    "metadata.chunk_index",
-                    "metadata.dim",
-                    "metadata.type",  # for job_marker filter
+                    "type",  # for job_marker filter
                 ),
             )
             records, _ = client.scroll(

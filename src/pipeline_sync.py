@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from .parser_utils import parse_document
 from .chunk import chunk_markdown
 from .embed import get_genai_embedding
-from .qdrant_utils import qdrant_client, ensure_collection, marker_point
+from .qdrant_utils import qdrant_client, ensure_collection, marker_point, build_payload
 from .logger import get_logger, EMBED_BATCH_SIZE, CHUNK_MAX_CHARS
 
 
@@ -91,7 +91,7 @@ def process_file(
         ensure_collection(client, collection, len(marker_vec))
 
         # Create payload indexes for downstream filtering.
-        for field_name in ("filename", "category", "type"):
+        for field_name in ("metadata.filename", "metadata.category", "type"):
             try:
                 client.create_payload_index(
                     collection_name=collection,
@@ -135,14 +135,14 @@ def process_file(
             points: List[Dict[str, Any]] = []
             for i, (text_chunk, vec) in enumerate(zip(batch, vectors)):
                 idx = chunk_index_offset + i
-                payload = {
-                    "text": text_chunk,         # put text at top for easy viewing
-                    "category": category,       # easy to scan
-                    "filename": doc_id,
-                    "chunk_index": idx,
-                    "dim": len(vec),
-                    "type": "chunk",
-                }
+                payload = build_payload(
+                    text=text_chunk,
+                    filename=doc_id,
+                    category=category,
+                    chunk_index=idx,
+                    dim=len(vec),
+                    type="chunk",
+                )
                 points.append(
                     {
                         "id": uuid.uuid4().hex,  # valid UUID (simple form)
