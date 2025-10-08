@@ -46,13 +46,19 @@ def run(pdf_path: str) -> Result:
     descs: List[FigureDesc] = []
     for f in figures:
         try:
-            text = vlm.describe_figure(f)
+            text = vlm.describe(
+                image_bytes=f.jpeg_bytes,
+                prompt=default_prompt()
+            )
         except Exception:
             # simple retry loop
             max_retries = 2
             for _ in range(max_retries):
                 try:
-                    text = vlm.describe_figure(f)
+                    text = vlm.describe(
+                        image_bytes=f.jpeg_bytes,
+                        prompt=default_prompt()
+                    )
                     break
                 except Exception:
                     text = ""

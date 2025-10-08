@@ -1,0 +1,8 @@
+.venv/
+.cache_fastembed/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+temp/

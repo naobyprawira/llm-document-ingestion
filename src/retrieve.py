@@ -101,7 +101,7 @@ def retrieve_health():
         "collection": QDRANT_COLLECTION or None,
         "dense_vector_name": DENSE_VECTOR_NAME,
         "bm25_model": BM25_MODEL,
-        "gemini_model": _gemini_model_path(),
+        "gemini_model": _google_model_path(),
     }
 
 @router.post("/retrieve/hybrid", response_model=HybridResponse)

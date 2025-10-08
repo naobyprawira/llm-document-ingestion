@@ -34,7 +34,7 @@ class DocParser:
             InputFormat.PDF: PdfFormatOption(pipeline_options=opts)
         })
 
-    def parse(self, pdf_path: str) -> Tuple[DoclingDocument, str, List[Figure]]:
+    def parse(self, pdf_path: str) -> Tuple[str, List[Figure]]:
         res = self.converter.convert(pdf_path)
         doc: DoclingDocument = res.document
         # Base markdown: placeholder mode so we don't embed images
@@ -68,4 +68,4 @@ class DocParser:
                 jpeg = to_jpeg_bytes(img)
                 figures.append(Figure(index=idx, page=page, caption=caption, jpeg_bytes=jpeg))
                 idx += 1
-        return doc, base_md, figures
+        return base_md, figures
