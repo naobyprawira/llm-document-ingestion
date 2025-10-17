@@ -23,6 +23,7 @@ Jika teks tidak terbaca, tulis "tidak terbaca" dan jangan menduga isinya.
 Masukkan semua teks yang terlihat, tambahkan penjelasan singkat jika perlu.
 Hormati format output yang diminta (plain text atau JSON) secara ketat.
 Gunakan ejaan baku dan tanda baca yang baik.
+Anda tidak perlu mendeskripsikan logo atau hal lainnya yang tidak berupa teks. Jika ada logo, cukup salin teks pada logo tersebut.
 """
 
 TEXT_TASK_TEMPLATE = """\
@@ -41,6 +42,7 @@ CONSTRAINTS:
   * Jangan menambahkan pengetahuan di luar gambar.
   * Jangan menyimpulkan maksud/konteks di luar yang terlihat.
   * Jangan mengarang teks yang tidak terbaca.
+  *  Anda tidak perlu mendeskripsikan logo atau hal lainnya yang tidak berupa teks. Jika ada logo, cukup salin teks pada logo tersebut
 - Panjang: maksimum {max_words} kata
 """
 
@@ -68,6 +70,34 @@ CONSTRAINTS:
 # Catatan: Template di atas memaksa keluaran berbahasa Indonesia, menekankan "hanya yang terlihat",
 # dan menyediakan slot untuk ketidakpastian, yang terbukti membantu menekan halusinasi.
 # Rujukan: Prompt design strategies & structured output di Gemini API.
+
+OCR_SYSTEM_RULES = """\
+Anda adalah sistem OCR tingkat lanjut. Transkripsikan teks pada halaman secara teliti,
+PERTAHANKAN tata letak dan struktur sebisa mungkin dengan Markdown (judul, daftar, tabel).
+Jangan meringkas; salin teks apa adanya termasuk nomor, simbol, dan pemformatan garis baru.
+Jika ada bagian yang tidak terbaca, tulis teks "-" di lokasi tersebut tanpa
+menebak isinya. Gunakan Bahasa Indonesia hanya untuk catatan penanda seperti "-".
+"""
+
+OCR_TASK_TEMPLATE = """\
+TASK:
+{task}
+
+PANDUAN:
+- Kembalikan seluruh teks yang TERLIHAT pada halaman secara lengkap.
+- Pertahankan urutan paragraf dan jeda baris seperti sumbernya.
+- Gunakan Markdown untuk struktur:
+  * Heading -> awali dengan tanda pagar (#) sesuai tingkat judul jika jelas.
+  * Daftar bernomor atau bullet -> gunakan format Markdown (`1.` atau `-`).
+  * Tabel -> gunakan tabel Markdown (baris header + pemisah + baris isi) bila memungkinkan.
+- Jika karakter tidak dapat dikenali, gantikan dengan "-" tanpa menebak.
+- Jangan menambahkan ringkasan, opini, atau informasi di luar teks yang terlihat.
+- Baca ulang hasil untuk memperbaiki kesalahan ketik atau format.
+
+Aturan Tambahan:
+- Dokumen peraturan di Indonesia umumnya memiliki kop surat di bagian atas, abaikan bagian ini.
+- Anda tidak perlu mendeskripsikan logo atau hal lainnya yang tidak berupa teks. Jika ada logo, cukup salin teks pada logo tersebut.
+"""
 
 
 # --- Public builders --------------------------------------------------------
@@ -115,6 +145,16 @@ def build_json_instruction(
 
 # --- Continuation builders (used when responses are truncated) --------------
 
+def build_ocr_instruction(
+    *,
+    task: str,
+    lang: str = "Indonesian",
+    system_rules: str = OCR_SYSTEM_RULES,
+) -> str:
+    """Return instruction block for OCR-style full text transcription."""
+    return system_rules + "\n" + OCR_TASK_TEMPLATE.format(task=task, lang=lang)
+
+
 def continue_text_instruction(
     *,
     base_instruction: str,
@@ -150,3 +190,8 @@ def continue_json_instruction(
 def default_prompt() -> str:
     """Legacy convenience function kept for compatibility."""
     return build_text_instruction(task="Jelaskan isi gambar secara ringkas.")
+
+
+def ocr_prompt() -> str:
+    """Prompt helper for OCR-style transcription."""
+    return "Transkripsikan seluruh teks pada halaman secara lengkap dengan format Markdown."

@@ -1,4 +1,4 @@
-"""Synchronous document ingestion pipeline.
+﻿"""Synchronous document ingestion pipeline.
 
 This module orchestrates the end-to-end ingestion flow: parsing PDFs or
 images, cleaning and chunking the resulting markdown, embedding chunks
@@ -13,14 +13,16 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from pathlib import Path
+from datetime import datetime
 from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Iterable, List, Optional
-
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from .parser_utils import parse_document
 from .chunk import chunk_markdown
 from .embed import get_genai_embedding
 from .qdrant_utils import qdrant_client, ensure_collection, marker_point, build_payload
 from .logger import get_logger, EMBED_BATCH_SIZE, CHUNK_MAX_CHARS
+from .parse_cache import ParseProgressTracker
 
 
 def _batched(seq: List[Any], size: int) -> Iterable[List[Any]]:
@@ -31,14 +33,19 @@ def _batched(seq: List[Any], size: int) -> Iterable[List[Any]]:
 
 def process_file(
     *,
-    data: bytes,
+    data: Optional[bytes] = None,
+    file_path: Optional[str] = None,
     filename: str,
     ext: str,
     category: str,
     collection: str,
     job_key: str,
+    cache_path: Optional[str] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Run the synchronous ingestion pipeline over a document."""
+    if data is None and file_path is None:
+        raise ValueError("process_file requires either 'data' or 'file_path'")
     log = get_logger(job=job_key, file=filename, phase="process")
     t_overall = time.perf_counter()
 
@@ -46,27 +53,81 @@ def process_file(
     doc_id = os.path.splitext(filename)[0]
 
     # -------- PARSE --------
-    if ext == ".pdf":
-        # Write to a temporary file because Docling requires a path
-        with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        try:
-            markdown, metadata = parse_document(tmp_path, filename, ext, job_key=job_key)
-        finally:
+    markdown: str
+    metadata: Dict[str, Any]
+    cache_loaded = False
+    parse_log = log.with_phase("parse")
+    tracker: Optional[ParseProgressTracker] = None
+
+    if cache_path:
+        cache_file = Path(cache_path)
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tracker = ParseProgressTracker(
+            cache_file,
+            parse_log,
+            progress_callback=progress_callback,
+        )
+        if tracker.has_final():
+            markdown, metadata = tracker.get_final()
+            cache_loaded = True
+            parse_log.info(
+                "Loaded cached parse result "
+                f"(size_bytes={metadata.get('file_size_bytes')} pages={metadata.get('page_count')})"
+            )
+        elif tracker.doc_ready():
+            parse_log.info("Found cached Docling checkpoint; resuming parse from cache")
+
+    if not cache_loaded:
+        if ext == ".pdf":
+            tmp_path = file_path
+            remove_tmp = False
+            if tmp_path is None:
+                if data is None:
+                    raise ValueError("PDF ingestion requires either 'data' bytes or 'file_path'")
+                with NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                remove_tmp = True
             try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-    else:
-        # Image inputs provide the raw bytes directly
-        markdown, metadata = parse_document("", filename, ext, image_bytes=data, job_key=job_key)
-    log.with_phase("parse").info(
-        f"Completed parse stage in {time.perf_counter() - t_overall:.3f}s"
-    )
+                markdown, metadata = parse_document(
+                    tmp_path,
+                    filename,
+                    ext,
+                    job_key=job_key,
+                    cache_tracker=tracker,
+                )
+            finally:
+                if remove_tmp and tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+        else:
+            if data is None:
+                try:
+                    if file_path is None:
+                        raise ValueError("Non-PDF ingestion requires 'data' or 'file_path'")
+                    with open(file_path, "rb") as fh:
+                        data = fh.read()
+                except Exception as exc:
+                    raise RuntimeError(f"Failed to load image bytes from {file_path}: {exc}") from exc
+            markdown, metadata = parse_document(
+                "",
+                filename,
+                ext,
+                image_bytes=data,
+                job_key=job_key,
+                cache_tracker=tracker,
+            )
+        parse_log.info(
+            f"Completed parse stage in {time.perf_counter() - t_overall:.3f}s"
+        )
+        if tracker:
+            tracker.finalize(markdown, metadata)
 
     # -------- CHUNK --------
     t_chunk = time.perf_counter()
+    log.with_phase("chunk").info("Starting chunk stage")
     chunks: List[str] = chunk_markdown(markdown, max_chars=CHUNK_MAX_CHARS)
     expected = len(chunks)
     log.with_phase("chunk").info(
@@ -222,3 +283,11 @@ def process_file(
 __all__ = [
     "process_file",
 ]
+
+
+
+
+
+
+
+

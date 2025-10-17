@@ -32,12 +32,10 @@ def cli(input_path: str, category: str, collection: str | None) -> None:
     load_dotenv()
     filename = os.path.basename(input_path)
     ext = os.path.splitext(filename)[1].lower()
-    with open(input_path, "rb") as f:
-        data = f.read()
     collection_name = collection or os.getenv("QDRANT_COLLECTION", "documents")
     job_key = os.path.splitext(filename)[0] + "-cli"
     result = process_file(
-        data=data,
+        file_path=input_path,
         filename=filename,
         ext=ext,
         category=category,

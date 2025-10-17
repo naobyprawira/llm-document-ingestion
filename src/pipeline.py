@@ -38,8 +38,8 @@ def run(pdf_path: str) -> Result:
     3. Compose the enriched markdown by inserting descriptions.
     4. Chunk the markdown and upload embeddings to Qdrant.
     """
-    parser = DocParser(images_scale=1.4, keep_page_images=False)
-    base_md, figures = parser.parse(pdf_path)
+    parser = DocParser(images_scale=1.4, keep_page_images=True)
+    _doc, base_md, figures, _page_images = parser.parse(pdf_path)
 
     # 2) describe images with VLM (respecting max concurrent in config)
     vlm = GeminiVLM(VLMConfig())

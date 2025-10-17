@@ -43,8 +43,10 @@ except Exception:
 # ✨ All prompt text now lives in prompts.py
 from .prompts import (
     DEFAULT_SYSTEM_RULES,
+    OCR_SYSTEM_RULES,
     build_text_instruction,
     build_json_instruction,
+    build_ocr_instruction,
     continue_text_instruction,
     continue_json_instruction,
 )
@@ -224,6 +226,45 @@ class GeminiVLM:
                 need_more = (fr == "MAX_TOKENS") or self._looks_incomplete_text(out)
         return out
 
+    def _generate_text_response(
+        self,
+        image_bytes: bytes,
+        instruction: str,
+        *,
+        max_continues: int = 4,
+    ) -> str:
+        """Shared helper to obtain plain-text responses with continuation handling."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.cfg.retry_max):
+            try:
+                parts = [
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    instruction,
+                ]
+                text, finish = self._gen_once(parts, response_mime_type=None, stream=True)
+
+                def make_parts_for_continue(tail: str) -> List[Any]:
+                    return [
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        continue_text_instruction(base_instruction=instruction, tail=tail),
+                    ]
+
+                full = self._continue_until_done(
+                    text,
+                    finish,
+                    make_parts_for_continue,
+                    want_json=False,
+                    max_continues=max_continues,
+                )
+                return full.strip()
+            except Exception as e:
+                last_exc = e
+                if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
+                    time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
+                    continue
+                break
+        return f"[VLM-ERROR] {last_exc}"
+
     # Public: plain text describe
     def describe(
         self,
@@ -241,31 +282,24 @@ class GeminiVLM:
         instruction = build_text_instruction(
             task=prompt, lang=lang, max_words=max_words, system_rules=system_rules
         )
-        last_exc: Optional[Exception] = None
-        for attempt in range(self.cfg.retry_max):
-            try:
-                parts = [
-                    types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                    instruction,
-                ]
-                text, finish = self._gen_once(parts, response_mime_type=None, stream=True)
+        return self._generate_text_response(image_bytes, instruction, max_continues=4)
 
-                def make_parts_for_continue(tail: str) -> List[Any]:
-                    return [
-                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                        continue_text_instruction(base_instruction=instruction, tail=tail),
-                    ]
-                full = self._continue_until_done(
-                    text, finish, make_parts_for_continue, want_json=False, max_continues=4
-                )
-                return full.strip()
-            except Exception as e:
-                last_exc = e
-                if _is_transient_error(e) and attempt < self.cfg.retry_max - 1:
-                    time.sleep(_backoff_seconds(self.cfg.retry_base, attempt))
-                    continue
-                break
-        return f"[VLM-ERROR] {last_exc}"
+    def transcribe(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        lang: str = "Indonesian",
+        system_rules: str = OCR_SYSTEM_RULES,
+        max_continues: int = 6,
+    ) -> str:
+        """Perform OCR-style transcription, preserving formatting as Markdown."""
+        instruction = build_ocr_instruction(
+            task=prompt,
+            lang=lang,
+            system_rules=system_rules,
+        )
+        return self._generate_text_response(image_bytes, instruction, max_continues=max_continues)
 
     # Public: structured JSON describe
     def describe_json(

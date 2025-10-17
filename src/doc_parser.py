@@ -22,6 +22,7 @@ class Figure:
 
 class DocParser:
     def __init__(self, images_scale: float = 1.4, keep_page_images: bool = False):
+        self.keep_page_images = bool(keep_page_images)
         opts = PdfPipelineOptions()
         opts.generate_picture_images = True
         opts.images_scale = images_scale
@@ -34,8 +35,16 @@ class DocParser:
             InputFormat.PDF: PdfFormatOption(pipeline_options=opts)
         })
 
-    def parse(self, pdf_path: str) -> Tuple[str, List[Figure]]:
-        res = self.converter.convert(pdf_path)
+    def parse(
+        self,
+        pdf_path: str,
+        *,
+        page_range: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[DoclingDocument, str, List[Figure], List[Tuple[int, bytes]]]:
+        if page_range:
+            res = self.converter.convert(pdf_path, page_range=page_range)
+        else:
+            res = self.converter.convert(pdf_path)
         doc: DoclingDocument = res.document
         # Base markdown: placeholder mode so we don't embed images
         base_md = doc.export_to_markdown(
@@ -43,6 +52,7 @@ class DocParser:
         )
 
         figures: List[Figure] = []
+        page_images: List[Tuple[int, bytes]] = []
         idx = 1
         for item, _lvl in doc.iterate_items():
             if isinstance(item, PictureItem):
@@ -68,4 +78,23 @@ class DocParser:
                 jpeg = to_jpeg_bytes(img)
                 figures.append(Figure(index=idx, page=page, caption=caption, jpeg_bytes=jpeg))
                 idx += 1
-        return base_md, figures
+        if self.keep_page_images:
+            images_attr = getattr(res, "page_images", None)
+            if images_attr:
+                for page_idx, entry in enumerate(images_attr, start=1):
+                    try:
+                        if hasattr(entry, "image"):
+                            pil_img = entry.image
+                            page_no = getattr(entry, "page_no", page_idx)
+                        elif isinstance(entry, tuple) and len(entry) == 2:
+                            page_no, pil_img = entry
+                        else:
+                            pil_img = entry
+                            page_no = page_idx
+                        if not isinstance(pil_img, Image.Image):
+                            continue
+                        jpeg_bytes = to_jpeg_bytes(pil_img)
+                        page_images.append((int(page_no or page_idx), jpeg_bytes))
+                    except Exception:
+                        continue
+        return doc, base_md, figures, page_images

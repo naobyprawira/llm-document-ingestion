@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 # Read basic configuration from the environment.  These values are used
@@ -23,14 +24,31 @@ CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "1024"))
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 _base_logger = logging.getLogger("ingestion")
+_formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | job=%(job)s file=%(file)s phase=%(phase)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 if not _base_logger.handlers:
-    _handler = logging.StreamHandler()
-    _formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s job=%(job)s file=%(file)s phase=%(phase)s msg=%(message)s"
-    )
-    _handler.setFormatter(_formatter)
-    _base_logger.addHandler(_handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(_formatter)
+    _base_logger.addHandler(stream_handler)
+
+_log_file_path = os.getenv("LOG_FILE", "logs/ingestion.log")
+if _log_file_path:
+    try:
+        log_path = Path(_log_file_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Avoid adding duplicate file handlers when module reloads.
+        if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == str(log_path) for h in _base_logger.handlers):
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setFormatter(_formatter)
+            _base_logger.addHandler(file_handler)
+    except Exception:
+        # Fallback silently to console-only logging if file handler setup fails.
+        pass
+
 _base_logger.setLevel(_LOG_LEVEL)
+_base_logger.propagate = False
 
 
 class _Adapter(logging.LoggerAdapter):

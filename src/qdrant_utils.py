@@ -1,4 +1,4 @@
-"""Helper functions for working with Qdrant.
+﻿"""Helper functions for working with Qdrant.
 
 Encapsulates: client creation, collection ensure, safe upsert, and
 schema-consistent point builders (text + metadata.*).
@@ -163,12 +163,13 @@ def marker_point(
 ) -> PointStruct:
     """
     Construct a 'job_marker' point payload using the normalized schema.
-    Stored entirely under payload['metadata'].
+    Job metadata (status, counts, etc.) remains under ``payload['metadata']``,
+    while the marker type is promoted to the top-level ``payload['type']`` so
+    it aligns with the chunk schema.
     """
     base = os.path.splitext(filename)[0]  # strip extension
 
     meta: Dict[str, Any] = {
-        "type": "job_marker",
         "job_key": job_key,
         "filename": base,
         "category": category,
@@ -181,8 +182,70 @@ def marker_point(
     if error:
         meta["error"] = str(error)
 
-    point_id = marker_id_for_filename(collection, base)
-    return PointStruct(id=point_id, vector=vector, payload={"metadata": meta})
+    marker_uuid = uuid.uuid5(uuid.NAMESPACE_URL, f"{collection}:{base}:{job_key}")
+    payload: Dict[str, Any] = {
+        "type": "job_marker",
+        "metadata": meta,
+    }
+    return PointStruct(id=str(marker_uuid), vector=vector, payload=payload)
+
+
+def delete_points_by_filename(
+    filename: str,
+    *,
+    collection: Optional[str] = None,
+    category: Optional[str] = None,
+    client: Optional[QdrantClient] = None,
+    batch: int = 256,
+) -> int:
+    """Delete all Qdrant points (chunks + markers) for a given filename."""
+    if not _HAS_QDRANT:
+        raise ImportError("qdrant-client is required")
+    collection_name = collection or os.getenv("QDRANT_COLLECTION", "documents")
+    qdrant = client or qdrant_client()
+
+    filename_base = os.path.splitext(filename)[0]
+
+    must_conditions = [
+        models.FieldCondition(
+            key="metadata.filename", match=models.MatchValue(value=filename_base)
+        )
+    ]
+    if category:
+        must_conditions.append(
+            models.FieldCondition(
+                key="metadata.category", match=models.MatchValue(value=category)
+            )
+        )
+
+    total_deleted = 0
+    offset: Optional[str] = None
+
+    while True:
+        points, offset = qdrant.scroll(
+            collection_name=collection_name,
+            scroll_filter=models.Filter(must=must_conditions),
+            limit=batch,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        if not points:
+            break
+
+        point_ids = [p.id for p in points if p.id is not None]
+        if point_ids:
+            qdrant.delete(
+                collection_name=collection_name,
+                points_selector=models.PointIdsSelector(point_ids=point_ids),
+                wait=True,
+            )
+            total_deleted += len(point_ids)
+
+        if offset is None:
+            break
+
+    return total_deleted
 
 __all__ = [
     "qdrant_client",
@@ -192,3 +255,4 @@ __all__ = [
     "safe_upsert",
     "build_payload",
 ]
+
